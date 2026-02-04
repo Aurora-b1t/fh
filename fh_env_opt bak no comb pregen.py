@@ -1,0 +1,839 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from commpy.filters import rrcosfilter
+from scipy.signal import upfirdn
+import gymnasium as gym
+from gymnasium import spaces
+import time
+
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# -----------------------------
+# 基础函数
+# -----------------------------
+def rcosdesign_srv(rolloff, span, sps):
+    """
+    Root raised cosine filter normalized to unit energy.
+    """
+    # Ensure odd length (span*sps + 1) so that group delay is integer and aligned with sps
+    rrc_filter = rrcosfilter(span * sps + 1, rolloff, 1, sps)[1]
+    rrc_filter = rrc_filter / np.sqrt(np.sum(rrc_filter ** 2) + 1e-12)
+    return rrc_filter
+
+
+def compute_psd_waterfall(signal, fs, f_start, f_end,
+                          dt=0.001,      # 1 ms time resolution
+                          df=10000.0,    # 10 kHz frequency resolution
+                          max_duration=0.1,  # analyze first 100 ms
+                          window='hann',
+                          plot=False,
+                          plot_title=""):
+    """
+    Optimized Compute PSD waterfall.
+    """
+    # ---- trim to first max_duration seconds ----
+    if max_duration is not None and max_duration > 0:
+        max_samples = int(max_duration * fs)
+        signal = signal[:max_samples]
+
+    Nwin = int(dt * fs)
+    if Nwin <= 0:
+        raise ValueError("Nwin must be positive. Check dt and fs.")
+    if len(signal) < Nwin:
+        return np.zeros((0, max(1, int(np.floor((f_end - f_start) / df)))) )
+
+    step = Nwin
+
+    if window == 'hann':
+        win = np.hanning(Nwin)
+    elif window == 'hamming':
+        win = np.hamming(Nwin)
+    else:
+        win = np.ones(Nwin)
+        
+    win_sq_sum = np.sum(win ** 2)
+
+    Nfft = int(2 ** np.ceil(np.log2(Nwin)))
+    freqs = np.fft.rfftfreq(Nfft, d=1.0 / fs)
+
+    n_bins = int(np.floor((f_end - f_start) / df))
+    n_bins = max(1, n_bins)
+    f_bin_edges = f_start + np.arange(n_bins + 1) * df
+
+    # Vectorized bin search
+    # Find insertion points of edges in freqs
+    # freqs is sorted.
+    edge_indices = np.searchsorted(freqs, f_bin_edges)
+    
+    valid_bins = []
+    for k in range(n_bins):
+        start_idx = edge_indices[k]
+        end_idx = edge_indices[k+1]
+        if end_idx > start_idx:
+            valid_bins.append((k, start_idx, end_idx))
+
+    waterfall = []
+    num_frames = (len(signal) - Nwin) // step + 1
+    
+    # Pre-calculate constants
+    norm_factor = 1.0 / (fs * win_sq_sum / Nwin)
+
+    for i in range(num_frames):
+        start = i * step
+        frame = signal[start:start + Nwin]
+        if len(frame) < Nwin:
+            break
+
+        frame_win = frame * win
+        spec = np.fft.rfft(frame_win, n=Nfft)
+        # Compute PSD directly
+        psd = (np.abs(spec) ** 2) * norm_factor
+
+        band_powers = np.zeros(n_bins)
+        
+        # Optimize loop using slicing
+        for k, s_idx, e_idx in valid_bins:
+            # sum is much faster on slice than np.where
+            band_powers[k] = np.sum(psd[s_idx:e_idx])
+
+        waterfall.append(band_powers)
+
+    waterfall = np.array(waterfall)  # [time, freq_bin]
+    eps = 1e-12
+    waterfall_db = 10 * np.log10(waterfall + eps)
+
+    if plot and waterfall_db.size > 0:
+        plt.figure(figsize=(8, 4))
+        plt.imshow(waterfall_db.T, origin="lower", aspect="auto", cmap="jet")
+        plt.colorbar(label='PSD (dB)')
+        plt.xlabel('Time bin')
+        plt.ylabel('Freq bin')
+        title_str = 'PSD Waterfall ({:.0f} ms)'.format(max_duration * 1e3)
+        if plot_title:
+            title_str += f"\n{plot_title}"
+        plt.title(title_str)
+        plt.tight_layout()
+        plt.show()
+
+    return waterfall_db
+
+# -----------------------------
+# M序列（LFSR）生成
+# -----------------------------
+def generate_mseq_states(n_bits=10, length=1000, taps=(10, 7), seed=1):
+    if seed == 0:
+        seed = 1
+    mask = (1 << n_bits) - 1
+    state = seed & mask
+    seq = []
+    for _ in range(length):
+        seq.append(state)
+        fb = 0
+        for t in taps:
+            fb ^= (state >> (n_bits - t)) & 1
+        state = ((state << 1) & mask) | fb
+        if state == 0:
+            state = 1
+    return np.array(seq, dtype=np.int64)
+
+# -----------------------------
+# 快速噪声源
+# -----------------------------
+class FastNoiseSource:
+    """
+    预生成长段带限噪声的缓冲区，避免反复计算 FFT/IFFT。
+    """
+    def __init__(self, Fs, bandwidth, duration=1.0):
+        self.length = int(Fs * duration)
+        # 1. Generate Gaussian noise
+        n = np.random.randn(self.length).astype(np.float32)
+        # 2. FFT
+        spec = np.fft.rfft(n)
+        # 3. Low-pass
+        cutoff_idx = int(np.floor(bandwidth * self.length / (2.0 * Fs)))
+        if cutoff_idx + 1 < len(spec):
+            spec[cutoff_idx + 1:] = 0
+        # 4. IFFT
+        n_lp = np.fft.irfft(spec, n=self.length)
+        # 5. Normalize
+        std_val = np.std(n_lp)
+        if std_val > 1e-12:
+            n_lp /= std_val
+        self.noise = n_lp
+
+    def get_noise(self, num_samples):
+        if num_samples >= self.length:
+            # 这种情况下直接返回全部并循环填充
+            tile_count = (num_samples // self.length) + 1
+            return np.tile(self.noise, tile_count)[:num_samples]
+            
+        start = np.random.randint(0, self.length - num_samples)
+        return self.noise[start : start + num_samples]
+
+
+# -----------------------------
+# 调制与信道
+# -----------------------------
+class QPSKModem:
+    def __init__(self, Baud, Fs, Ns, Nh):
+        self.Baud = Baud
+        self.Fs = Fs
+        self.Ns = Ns
+        self.Nh = Nh
+        self.LBF = rcosdesign_srv(0.5, 16, Ns)
+
+    def generate_bits(self, Bitrate):
+        return np.random.binomial(n=1, p=0.5, size=Bitrate)
+
+    def pulse_shape(self, bits):
+        bits = np.asarray(bits).astype(np.int8)
+        if len(bits) % 2 != 0:
+            bits = np.concatenate([bits, np.array([0], dtype=np.int8)])
+
+        I_bits = 2 * bits[0::2] - 1
+        Q_bits = 2 * bits[1::2] - 1
+        n_syms = len(I_bits)
+
+        I_f = upfirdn(self.LBF, I_bits, up=self.Ns)
+        Q_f = upfirdn(self.LBF, Q_bits, up=self.Ns)
+        gd = (len(self.LBF) - 1) // 2
+        I_pulse = I_f[gd:gd + n_syms * self.Ns]
+        Q_pulse = Q_f[gd:gd + n_syms * self.Ns]
+        return I_pulse, Q_pulse
+
+
+class FHSSChannel:
+    def __init__(self, Startfre, Sub_interval, Hoprate, Fs):
+        self.Startfre = Startfre
+        self.Sub_interval = Sub_interval
+        self.Hoprate = Hoprate
+        self.Fs = Fs
+
+    def hop_carrier(self, t, hop_seq):
+        """
+        Return complex carrier directly: exp(j*phi)
+        """
+        N = len(t)
+        if N == 0:
+            return np.zeros(0, dtype=complex)
+
+        s_per_hop = self.Fs / float(self.Hoprate)
+        hop_idx = np.empty(N, dtype=int)
+        pos = 0
+        k = 0
+        while pos < N and k < len(hop_seq):
+            next_pos = int(round((k + 1) * s_per_hop))
+            next_pos = min(N, max(pos + 1, next_pos))
+            hop_idx[pos:next_pos] = hop_seq[k]
+            pos = next_pos
+            k += 1
+        if pos < N:
+            last_idx = max(0, min(k - 1, len(hop_seq) - 1))
+            hop_idx[pos:] = hop_seq[last_idx]
+
+        hop_fre = self.Startfre + hop_idx * self.Sub_interval + 0.5 * self.Sub_interval
+        phase = 2 * np.pi * np.cumsum(hop_fre) / self.Fs
+        # Optimized: calculate complex exponential directly
+        carrier_complex = np.exp(1j * phase)
+        return carrier_complex
+
+    def transmit(self, I_pulse, Q_pulse, carrier_complex, noise_std=0.1):
+        # carrier_complex is exp(j*phi)
+        baseband = I_pulse + 1j * Q_pulse
+        rf_complex = baseband * carrier_complex
+        noise = noise_std * np.random.randn(len(rf_complex))
+        return rf_complex, noise
+
+
+class QPSKReceiver:
+    def __init__(self, Ns):
+        self.Ns = Ns
+        self.MF = rcosdesign_srv(0.5, 16, Ns)
+
+    def demodulate(self, modu_signal, bits, carrier_complex):
+        # demodulate multiplying by conj(carrier)
+        demod_complex = modu_signal * np.conj(carrier_complex)
+
+        y_complex = upfirdn(self.MF, demod_complex, up=1, down=self.Ns)
+
+        gd = (len(self.MF) - 1) // 2
+        start_idx = gd // self.Ns
+        
+        y_complex = y_complex[start_idx:]
+
+        y_i_end = np.real(y_complex)
+        y_q_end = np.imag(y_complex)
+
+        y_i_end = (y_i_end >= 0).astype(int)
+        y_q_end = (y_q_end >= 0).astype(int)
+
+        num_syms = len(bits) // 2
+        min_len = min(len(y_i_end), len(y_q_end), num_syms)
+        y_i_end = y_i_end[:min_len]
+        y_q_end = y_q_end[:min_len]
+
+        receive_data = np.zeros(2 * min_len, dtype=int)
+        receive_data[::2] = y_i_end
+        receive_data[1::2] = y_q_end
+
+        bit_error = np.mean(receive_data != bits[:2 * min_len]) if min_len > 0 else 0.0
+        return receive_data, bit_error
+
+
+class ReactiveJammer:
+    def __init__(self, Fs, speed=10.0, power=0.5, bandwidth=50000.0, noise_source=None):
+        self.Fs = float(Fs)
+        self.speed = float(speed)
+        self.power = float(power)
+        self.bandwidth = float(bandwidth)
+        # Shared noise source
+        if noise_source is None:
+            self.noise_source = FastNoiseSource(Fs, bandwidth)
+        else:
+            self.noise_source = noise_source
+
+    def generate(self, t, hop_seq, Startfre, Sub_interval, hoprate):
+        N = len(t)
+        if hoprate > self.speed or N == 0:
+            return np.zeros_like(t), False
+
+        # Use fast noise source
+        raw_noise = self.noise_source.get_noise(N)
+        baseband_noise = raw_noise * self.power
+
+        s_per_hop = self.Fs / float(hoprate)
+        jam = np.zeros(N)
+        pos = 0
+        k = 0
+        
+        phase_k = 2 * np.pi / self.Fs
+
+        while pos < N and k < len(hop_seq):
+            next_pos = int(round((k + 1) * s_per_hop))
+            next_pos = min(N, max(pos + 1, next_pos))
+            length = next_pos - pos
+            
+            f_c = Startfre + hop_seq[k] * Sub_interval + 0.5 * Sub_interval
+            
+            t_seg_local = np.arange(length) 
+            carrier = np.cos((phase_k * f_c) * t_seg_local)
+            
+            jam[pos:next_pos] = baseband_noise[pos:next_pos] * carrier
+            
+            pos = next_pos
+            k += 1
+            
+        if pos < N:
+            last_idx = max(0, min(k - 1, len(hop_seq) - 1))
+            f_last = Startfre + hop_seq[last_idx] * Sub_interval + 0.5 * Sub_interval
+            length = N - pos
+            t_seg_local = np.arange(length)
+            carrier = np.cos((phase_k * f_last) * t_seg_local)
+            jam[pos:] = baseband_noise[pos:] * carrier
+            
+        return jam, True
+
+
+class IndiscriminateJammer:
+    def __init__(self, Fs, step=5000.0, power=0.2, dwell_time=0.2, bandwidth=50000.0, noise_source=None):
+        self.Fs = float(Fs)
+        self.step = float(step)
+        self.power = float(power)
+        self.dwell_time = float(dwell_time)
+        self.bandwidth = float(bandwidth)
+        self._sweep_idx = 0
+        
+        if noise_source is None:
+            self.noise_source = FastNoiseSource(Fs, bandwidth)
+        else:
+            self.noise_source = noise_source
+
+    def generate(self, t, Startfre, Endfre):
+        N = len(t)
+        if N == 0:
+            return np.zeros_like(t), []
+            
+        raw_noise = self.noise_source.get_noise(N)
+        baseband_noise = raw_noise * self.power
+        
+        dt_samp = t[1] - t[0] if len(t) > 1 else 1e-3
+        samples_per_dwell = max(1, int(round(self.dwell_time / max(dt_samp, 1e-12))))
+        num_segments = int(np.ceil(len(t) / samples_per_dwell))
+
+        bw = max(Endfre - Startfre, self.step)
+        num_steps = max(1, int(np.floor(bw / self.step)))
+        jam = np.zeros_like(t)
+        freqs_used = []
+        idx = self._sweep_idx
+        
+        phase_k = 2 * np.pi / self.Fs
+        
+        for seg in range(num_segments):
+            f = Startfre + (idx % num_steps) * self.step + self.step / 2.0
+            if f >= Endfre:
+                f = Startfre + np.mod(f - Startfre, bw)
+            s = seg * samples_per_dwell
+            e = min(len(t), (seg + 1) * samples_per_dwell)
+            length = e - s
+            
+            t_seg_local = np.arange(length)
+            carrier = np.cos((phase_k * f) * t_seg_local)
+            jam[s:e] = baseband_noise[s:e] * carrier
+            
+            freqs_used.append(f)
+            idx += 1
+        self._sweep_idx = idx
+        return jam, freqs_used
+
+
+# -----------------------------
+# Gym 环境封装
+# -----------------------------
+class FHSSQPSKEnv(gym.Env):
+    metadata = {"render.modes": ["human"]}
+
+    def __init__(self,
+                 Startfre=3e6,
+                 Endfre=4e6,
+                 Fs=1e7,
+                 Sub_interval=50000,
+                 Hoprate=100,
+                 hoprate_min=10.0,
+                 hoprate_max=1000.0,
+                 Baud=25000,
+                 dt=0.001,
+                 df=10000.0,
+                 enable_reactive=False,
+                 reactive_speed=160.0,
+                 reactive_power=0.5,
+                 reactive_bandwidth=50000.0,
+                 enable_sweep=True,
+                 sweep_step=50000,
+                 sweep_power=0.5,
+                 sweep_dwell=0.004,
+                 sweep_bandwidth=100000.0,
+                 enable_rayleigh=False,
+                 rayleigh_coherence=800,
+                 mseq_length=1000,
+                 mseq_nbits=10,
+                 mseq_taps=(10, 7),
+                 mseq_seed=1,
+                 debug_plot_psd=False,
+                 debug_log_hops=False,
+                 reset_mseq_each_step=True,
+                 use_pregen=True,
+                 pregen_pool_size=50):
+        super().__init__()
+
+        self.use_pregen = bool(use_pregen)
+        self.pregen_pool_size = int(pregen_pool_size)
+
+        self.Startfre = float(Startfre)
+        self.Endfre = float(Endfre)
+        self.Fs = int(Fs)
+        self.Sub_interval = float(Sub_interval)
+        self.Baud = int(Baud)
+        self.Tb = 1.0 / self.Baud
+        self.Ns = int(self.Fs / self.Baud)
+        self.dt = float(dt)
+        self.df = float(df)
+
+        self.num_channels = int(round((self.Endfre - self.Startfre) / self.Sub_interval))
+        self.num_channels = max(1, self.num_channels)
+
+        self.hoprate_min = float(hoprate_min)
+        self.hoprate_max = float(hoprate_max) if hoprate_max is not None else float(Baud)
+        self.base_hoprate = float(Hoprate)
+
+        self.Nh = 200 if (200 % 2 == 0) else 202
+        self.current_hoprate = float(Hoprate)
+        self.modem = QPSKModem(self.Baud, self.Fs, self.Ns, self.Nh)
+        self.channel = FHSSChannel(self.Startfre, self.Sub_interval, self.current_hoprate, self.Fs)
+        self.receiver = QPSKReceiver(self.Ns)
+        
+        self.enable_reactive = bool(enable_reactive)
+        self.enable_sweep = bool(enable_sweep)
+
+        # Share noise source if bandwidths match
+        shared_noise_source = None
+        if self.enable_reactive and self.enable_sweep and reactive_bandwidth == sweep_bandwidth:
+            shared_noise_source = FastNoiseSource(self.Fs, reactive_bandwidth)
+        
+        if self.enable_reactive:
+            ns = shared_noise_source if shared_noise_source else None
+            # If no shared source (bandwidth mismatch or only one enabled), ReactiveJammer will create one if ns is None
+            # But wait, ReactiveJammer default behavior is creating new one.
+            # If shared_noise_source is None but we haven't created one, we let it create.
+            self.reactive = ReactiveJammer(Fs=self.Fs,
+                                           speed=reactive_speed,
+                                           power=reactive_power,
+                                           bandwidth=reactive_bandwidth,
+                                           noise_source=ns)
+        else:
+            self.reactive = None
+                                       
+        if self.enable_sweep:
+            ns = shared_noise_source if shared_noise_source else None
+            # If shared_noise_source is used by reactive, we reuse it.
+            self.sweep = IndiscriminateJammer(Fs=self.Fs,
+                                              step=sweep_step if sweep_step is not None else self.Sub_interval,
+                                              power=sweep_power,
+                                              dwell_time=sweep_dwell,
+                                              bandwidth=sweep_bandwidth,
+                                              noise_source=ns)
+        else:
+            self.sweep = None
+
+        self.enable_rayleigh = bool(enable_rayleigh)
+        self.rayleigh_coherence = float(rayleigh_coherence)
+
+        self.mseq_states = generate_mseq_states(n_bits=mseq_nbits,
+                                                length=mseq_length,
+                                                taps=mseq_taps,
+                                                seed=mseq_seed)
+        self.mseq_channels = (self.mseq_states % self.num_channels).astype(int)
+        self._mseq_ptr = 0
+        self.reset_mseq_each_step = bool(reset_mseq_each_step)
+
+        self.action_space = spaces.Dict({
+            "hoprate": spaces.Box(
+                low=np.array([self.hoprate_min], dtype=np.float32),
+                high=np.array([self.hoprate_max], dtype=np.float32),
+                dtype=np.float32
+            ),
+            "offsets": spaces.Box(
+                low=np.zeros(10, dtype=np.float32),
+                high=np.full(10, max(1, self.num_channels - 1), dtype=np.float32),
+                shape=(10,),
+                dtype=np.float32
+            ),
+        })
+
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=(1, 1), dtype=np.float32
+        )
+
+        self.state = None
+        self.last_info = {}
+
+        self.debug_plot_psd = bool(debug_plot_psd)
+        self.debug_log_hops = bool(debug_log_hops)
+        self.current_step = 0
+
+        self.pregen_data = {}
+        if self.use_pregen:
+            print("Initializing pre-generated data... this may take a moment.")
+            self._init_pregen()
+            print("Pre-generation complete.")
+
+        self._apply_hoprate(self.base_hoprate)
+
+    def _init_pregen(self):
+        num_syms_block = int(round(self.Baud * 0.1))
+        
+        pool_bits = []
+        pool_I = []
+        pool_Q = []
+        
+        # Pre-generate baseband signals
+        for _ in range(self.pregen_pool_size):
+            bits = self.modem.generate_bits(2 * num_syms_block)
+            I_p, Q_p = self.modem.pulse_shape(bits)
+            pool_bits.append(bits)
+            pool_I.append(I_p)
+            pool_Q.append(Q_p)
+            
+        self.pregen_data['bits'] = pool_bits
+        self.pregen_data['I'] = pool_I
+        self.pregen_data['Q'] = pool_Q
+        
+        len_p = len(pool_I[0])
+        self.pregen_data['len_pulse'] = len_p
+        
+        # Pre-generate noise
+        pool_noise = []
+        for _ in range(self.pregen_pool_size):
+            n = np.random.randn(len_p)
+            pool_noise.append(n)
+        self.pregen_data['noise'] = pool_noise
+        
+        # Pre-generate Rayleigh fading
+        if self.enable_rayleigh:
+            pool_ray = []
+            for _ in range(self.pregen_pool_size):
+                r = self._generate_rayleigh(len_p)
+                if r is None: r = np.ones(len_p)
+                pool_ray.append(r)
+            self.pregen_data['rayleigh'] = pool_ray
+            
+        # Pre-generate Sweep Jamming
+        if self.enable_sweep and self.sweep:
+            pool_sweep = []
+            t_dummy = np.arange(len_p) / self.Fs
+            # Generate sequential sweep patterns
+            saved_idx = self.sweep._sweep_idx
+            self.sweep._sweep_idx = 0 # Reset for consistent pregen
+            
+            for _ in range(self.pregen_pool_size):
+                sw, _ = self.sweep.generate(t_dummy, self.Startfre, self.Endfre)
+                pool_sweep.append(sw)
+            
+            self.sweep._sweep_idx = saved_idx
+            self.pregen_data['sweep'] = pool_sweep
+
+        self._pregen_ptr = 0
+
+    def seed(self, seed=None):
+        np.random.seed(seed)
+
+    def _apply_hoprate(self, hoprate_target):
+        hoprate_clip = float(np.clip(hoprate_target, self.hoprate_min, self.hoprate_max))
+        hoprate_used = float(int(round(hoprate_clip / 10.0)) * 10)
+
+        Nh = max(2, int(round(self.Baud / max(hoprate_used, 1e-9))))
+        if Nh % 2 != 0:
+            Nh += 1
+
+        self.Nh = Nh
+        self.modem.Nh = Nh
+        self.current_hoprate = hoprate_used
+        self.channel.Hoprate = hoprate_used
+
+        return {
+            "hoprate_action": hoprate_target,
+            "hoprate_used": hoprate_used,
+            "Nh_used": Nh
+        }
+
+    def _generate_rayleigh(self, length):
+        if (not self.enable_rayleigh) or length <= 0:
+            return None
+        coh = max(1, int(self.rayleigh_coherence))
+        num_seg = int(np.ceil(length / coh))
+        mags = np.random.rayleigh(scale=np.sqrt(2) / 2, size=num_seg)
+        mag_seq = np.repeat(mags, coh)[:length]
+        return mag_seq
+
+    def _observe_100ms(self, block_id=None):
+        N_obs = int(0.1 * self.Fs)
+        t_obs = np.arange(N_obs) / self.Fs
+
+        sweep_jam = np.zeros(N_obs)
+        if self.enable_sweep and self.sweep is not None:
+            sweep_jam, _ = self.sweep.generate(t_obs, self.Startfre, self.Endfre)
+
+        noise = 0.1 * np.random.randn(N_obs)
+        obs_signal = sweep_jam + noise
+
+        plot_title = ""
+        do_plot = self.debug_plot_psd
+        if block_id is not None:
+            plot_title = f"Step {self.current_step} - Block {block_id}"
+
+        waterfall_db = compute_psd_waterfall(
+            obs_signal,
+            fs=self.Fs,
+            f_start=self.Startfre,
+            f_end=self.Endfre,
+            dt=self.dt,
+            df=self.df,
+            max_duration=0.1,
+            plot=do_plot,
+            plot_title=plot_title
+        )
+        return waterfall_db
+
+    def _get_block_hopseq(self, hops_per_block, offset):
+        if hops_per_block <= 0:
+            return np.array([], dtype=int)
+
+        end_ptr = self._mseq_ptr + hops_per_block
+        if end_ptr <= len(self.mseq_channels):
+            base = self.mseq_channels[self._mseq_ptr:end_ptr]
+        else:
+            part1 = self.mseq_channels[self._mseq_ptr:]
+            part2 = self.mseq_channels[:(end_ptr - len(self.mseq_channels))]
+            base = np.concatenate([part1, part2])
+        
+        off_int = int(np.round(offset)) % self.num_channels
+        hop_seq = (base + off_int) % self.num_channels
+        return hop_seq
+
+    def reset(self):
+        self.current_step = 0
+        _ = self._apply_hoprate(self.base_hoprate)
+
+        obs = self._observe_100ms(block_id=0)
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=obs.shape, dtype=np.float32
+        )
+        self.state = obs.astype(np.float32)
+        self.last_info = {
+            "ber_blocks": [],
+            "hoprate_used": self.current_hoprate,
+        }
+        return self.state, self.last_info
+
+    def step(self, action=None):
+        self.current_step += 1
+        if action is None:
+            hoprate_action = self.base_hoprate
+            offsets_action = np.zeros(10, dtype=np.int32)
+        else:
+            if isinstance(action, dict):
+                hoprate_action = float(action.get("hoprate", self.base_hoprate))
+                offsets_action = np.array(action.get("offsets", np.zeros(10)), dtype=np.float32)
+            elif isinstance(action, (list, tuple)) and len(action) == 2:
+                hoprate_action = float(action[0])
+                offsets_action = np.array(action[1], dtype=np.float32)
+            else:
+                hoprate_action = float(action)
+                offsets_action = np.zeros(10, dtype=np.float32)
+
+        offsets_action = np.array(offsets_action, dtype=np.float32)
+        if offsets_action.shape != (10,):
+            raise ValueError("offsets 必须是长度为10的向量。")
+
+        ainfo = self._apply_hoprate(hoprate_action)
+
+        hops_per_block = int(round(self.current_hoprate * 0.1))
+        hops_per_block = max(1, hops_per_block)
+
+        ber_blocks = []
+        reactive_active_blocks = []
+
+        for b in range(10):
+            # --- Pre-generation / Dynamic Choice ---
+            if self.use_pregen:
+                ptr = self._pregen_ptr
+                bits_block = self.pregen_data['bits'][ptr]
+                I_pulse = self.pregen_data['I'][ptr]
+                Q_pulse = self.pregen_data['Q'][ptr]
+                noise = 0.1 * self.pregen_data['noise'][ptr]
+                
+                if 'rayleigh' in self.pregen_data:
+                    rayleigh_mag = self.pregen_data['rayleigh'][ptr]
+                else:
+                    rayleigh_mag = 1.0
+
+                if 'sweep' in self.pregen_data:
+                    sweep_jam = self.pregen_data['sweep'][ptr]
+                else:
+                    sweep_jam = 0.0
+
+                self._pregen_ptr = (self._pregen_ptr + 1) % self.pregen_pool_size
+                
+                baseband = I_pulse + 1j * Q_pulse
+            
+            else:
+                num_syms_block = int(round(self.Baud * 0.1))
+                bits_block = self.modem.generate_bits(2 * num_syms_block)
+                I_pulse, Q_pulse = self.modem.pulse_shape(bits_block)
+                baseband = I_pulse + 1j * Q_pulse
+
+                current_len = len(I_pulse)
+                noise = 0.1 * np.random.randn(current_len)
+
+                rayleigh_mag = self._generate_rayleigh(current_len)
+                if rayleigh_mag is None:
+                    rayleigh_mag = 1.0
+
+                if self.enable_sweep and self.sweep is not None:
+                    t_dummy = np.arange(current_len) / self.Fs
+                    sweep_jam, _ = self.sweep.generate(t_dummy, self.Startfre, self.Endfre)
+                else:
+                    sweep_jam = 0.0
+
+            # --- Common processing ---
+            t_block = np.arange(len(I_pulse)) / self.Fs
+
+            hop_seq_block = self._get_block_hopseq(hops_per_block, offsets_action[b])
+            self._mseq_ptr = (self._mseq_ptr + len(hop_seq_block)) % len(self.mseq_channels)
+
+            carrier_complex = self.channel.hop_carrier(t_block, hop_seq_block)
+            
+            rf_complex = baseband * carrier_complex
+            
+            reactive_jam = 0.0
+            reactive_active = False
+            if self.enable_reactive and self.reactive is not None:
+                reactive_jam, reactive_active = self.reactive.generate(
+                    t_block, hop_seq_block, self.Startfre, self.Sub_interval, self.current_hoprate
+                )
+            
+            # Combine all signal components
+            rx_real = np.real(rf_complex * rayleigh_mag) + reactive_jam + sweep_jam + noise
+            
+            start_time = time.time()
+
+            _, ber = self.receiver.demodulate(rx_real, bits_block, carrier_complex)
+            ber_blocks.append(float(ber))
+            reactive_active_blocks.append(bool(reactive_active))
+
+            end_time = time.time()
+            if self.debug_log_hops:
+                print(f"Block {b+1} processing time: {end_time - start_time:.4f} s")
+
+            if self.debug_plot_psd:
+                compute_psd_waterfall(
+                    rx_real,
+                    fs=self.Fs,
+                    f_start=self.Startfre,
+                    f_end=self.Endfre,
+                    dt=self.dt,
+                    df=self.df,
+                    max_duration=0.1,
+                    plot=True,
+                    plot_title=f"Step {self.current_step} - Block {b+1}"
+                )
+            if self.debug_log_hops:
+                print(f"Block {b+1}: Hop Seq (with offset) = {hop_seq_block.tolist()}")
+
+        obs = self._observe_100ms(block_id=0)
+        self.state = obs.astype(np.float32)
+
+        if self.reset_mseq_each_step:
+            self._mseq_ptr = 0
+
+        mean_ber = float(np.mean(ber_blocks)) if len(ber_blocks) > 0 else 0.0
+        reward = 0.5 - mean_ber - ainfo["hoprate_used"] * 0.0001
+
+        self.last_info = {
+            "ber_blocks": ber_blocks,
+            "mean_ber": mean_ber,
+            "hoprate_used": ainfo["hoprate_used"],
+            "hops_per_block": hops_per_block,
+            "reactive_active_blocks": reactive_active_blocks,
+        }
+
+        terminated = False
+        truncated = False
+        return self.state, reward, terminated, truncated, self.last_info
+
+    def render(self, mode="human"):
+        if self.state is None:
+            return
+        plt.figure(figsize=(8, 4))
+        plt.imshow(self.state.T, origin="lower", aspect="auto", cmap="jet")
+        plt.colorbar(label='PSD (dB)')
+        plt.xlabel('Time bin')
+        plt.ylabel('Freq bin')
+        plt.title('PSD Waterfall (100 ms observation)')
+        plt.tight_layout()
+        plt.show()
+
+
+if __name__ == "__main__":
+    env = FHSSQPSKEnv(enable_reactive=True,
+                      enable_sweep=True,
+                      enable_rayleigh=True,
+                      debug_plot_psd=True,
+                      debug_log_hops=False)
+    obs, info = env.reset()
+
+    offsets = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
+    action = {"hoprate": 120.0, "offsets": offsets}
+    for i in range(10):
+        obs, reward, terminated, truncated, info = env.step(action)
+        print(f"Step {i+1}: Reward: {reward}, Mean BER: {info['mean_ber']}")
