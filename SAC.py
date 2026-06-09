@@ -50,6 +50,38 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
+class EASReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = collections.deque(maxlen=capacity)
+
+    def add(self, state_img, hoprate, action_arr, teacher_action,
+            search_gain=0.0, candidate_count=0):
+        self.buffer.append((
+            np.array(state_img, dtype=np.float32),
+            float(hoprate),
+            np.array(action_arr, dtype=np.float32),
+            int(teacher_action),
+            float(search_gain),
+            int(candidate_count),
+        ))
+
+    def sample(self, batch_size):
+        transitions = random.sample(self.buffer, batch_size)
+        (state_imgs, hoprates, action_arrs, teacher_actions,
+         search_gains, candidate_counts) = zip(*transitions)
+        return {
+            "state_imgs": np.array(state_imgs, dtype=np.float32),
+            "hoprates": np.array(hoprates, dtype=np.float32),
+            "action_arrs": np.array(action_arrs, dtype=np.float32),
+            "teacher_actions": np.array(teacher_actions, dtype=np.int64),
+            "search_gains": np.array(search_gains, dtype=np.float32),
+            "candidate_counts": np.array(candidate_counts, dtype=np.int64),
+        }
+
+    def size(self):
+        return len(self.buffer)
+
+
 # ----------------------------------------- #
 # 卷积 + 额外特征版策略网络
 # 额外特征 extra = [hoprate(1), action_arr(10)] 共 11 维，不经过卷积

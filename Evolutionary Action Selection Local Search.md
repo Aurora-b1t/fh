@@ -21,7 +21,8 @@
 - 保留原始离散 SAC 作为 baseline；
 - 不改变“10 个 offset = 10 个顺序决策”的建模语义；
 - 在每个单步 offset 决策时增加 **局部邻域搜索**；
-- 将局部搜索后得到的更优动作再蒸馏回 actor。
+- 不让局部搜索结果直接替换环境执行动作；
+- 将局部搜索得到的更优动作作为 teacher 样本单独存储，并在训练时再利用。
 
 ## 2. 核心思想
 
@@ -34,7 +35,8 @@
 - 不做 10-offset 联合搜索；
 - 只在**单个离散 offset 决策点**做局部搜索；
 - 用 critic 对候选动作评分；
-- 用搜索后的执行动作作为 teacher，对 actor 加蒸馏损失。
+- 环境仍执行 actor 原始采样动作；
+- 将搜索得到的更优动作写入单独的 EAS replay，训练时再用于蒸馏 actor。
 
 ## 3. 与原始离散 SAC 的区别
 
@@ -56,36 +58,59 @@
 
 在 [SAC_eas_local.py](SAC_eas_local.py) 中，对每个 offset 决策增加两步：
 
-### A. 局部邻域搜索
+### A. 局部邻域搜索（仅生成 teacher 候选）
 
 对于 actor 采样得到的 seed action：
 
 1. 构造局部邻域候选集：`seed_action ± search_radius`
 2. 使用 twin critics 对这些候选动作逐个评分
 3. 默认采用 `min(Q1, Q2)` 作为保守评分
-4. 选择局部评分最高的动作作为最终执行动作
+4. 选择局部评分最高的动作作为 `best_action`
 
-因此，执行动作不再总是 actor 原始采样值，而是：
+但与旧版本不同的是：
 
-- **actor proposal + local critic refinement**
+- **环境执行的仍然是 actor 原始采样得到的 `seed_action`**
+- `best_action` **不会直接用于环境执行**
+- `best_action` 仅作为后续训练的 teacher 候选样本
 
-### B. 蒸馏回 actor
+因此这里的语义是：
 
-训练时，除了保留原始 SAC actor loss，还加入一个蒸馏项：
+- **actor proposal for execution + local critic teacher proposal for training**
 
-- teacher 采用 replay 中记录的最终执行动作
-- actor logits 对 teacher action 做 cross-entropy
+### B. 单独 EAS replay + 训练阶段动态过滤
+
+训练时，除了保留原始 SAC actor loss，还额外引入一个来自 EAS replay 的蒸馏项。
+
+EAS replay 中记录的是：
+
+- 当前状态 `(state_img, hoprate, action_arr)`
+- 局部搜索得到的 `best_action`
+- 可选统计信息（如 `search_gain`）
+
+注意：
+
+- 写入 EAS replay 时**不做过滤**；
+- 真正是否使用该 teacher 样本，是在 **update 阶段** 动态决定的。
+
+具体地说：
+
+1. 从 EAS replay 采样 teacher 样本；
+2. 对每条样本，先用**当前 actor**在该状态下给出当前动作（实现上可固定取 `argmax` 以避免额外采样噪声）；
+3. 用当前 critic 比较：
+   - replay 中的 `best_action`
+   - 当前 actor 动作
+4. 只有当 `best_action` 在当前 critic 视角下仍然更优时，该样本才保留蒸馏梯度；否则本次 mask 掉。
 
 总 actor loss 为：
 
 ```text
-actor_total_loss = sac_actor_loss + distill_coef * distill_loss
+actor_total_loss = sac_actor_loss + distill_coef * masked_distill_loss
 ```
 
 其中：
 
 - `sac_actor_loss`：原始离散 SAC actor objective
-- `distill_loss`：对局部搜索执行动作的离散监督
+- `masked_distill_loss`：仅对“当前仍优于 actor 动作”的 teacher 样本计算的监督损失
 - `distill_coef`：蒸馏权重
 
 ## 4. 为什么只做单步局部搜索
@@ -105,32 +130,49 @@ actor_total_loss = sac_actor_loss + distill_coef * distill_loss
 
 - 与现有 trainer 完全兼容
 - 不需要修改环境结构
-- 不需要修改 replay schema
 - 能保持 baseline 与改进版的可比性
 
-## 5. replay 中记录什么动作
+## 5. 两类 replay 各自记录什么
 
-改进版中，replay 记录的是：
+### 普通 replay
 
-- **局部搜索后的最终执行动作**
+普通 replay 中记录的是：
 
-而不是 actor 原始采样得到的 seed action。
+- **环境真实执行动作 `seed_action` 对应的 transition**
 
-这样做的理由：
+它继续服务于：
 
-1. replay 中动作必须与环境真实执行动作一致；
-2. 蒸馏时可以直接把 replay action 当作 teacher；
-3. 不需要给 replay 额外增加字段，保持数据结构与 baseline 一致。
+- critic TD 学习
+- 标准 SAC actor 学习
+
+### EAS replay
+
+EAS replay 中记录的是：
+
+- **局部搜索得到的 `best_action` teacher 样本**
+
+它只服务于：
+
+- actor 的额外蒸馏监督
+
+因此，相比 baseline：
+
+- 普通 replay 语义不变；
+- 但新增了一个单独的 teacher replay buffer。
 
 ## 6. 新增配置项
 
-在 [settings.py](settings.py) 中新增了 `EAS_LOCAL_CONFIG`，用于控制改进版：
+在 [settings.py](settings.py) 中新增或扩展 `EAS_LOCAL_CONFIG`，用于控制改进版：
 
 - `search_radius`：局部邻域半径
 - `distill_coef`：蒸馏损失权重
 - `search_eval`：候选动作评分方式，当前默认 `min_q`
-- `teacher_from_replay`：是否用 replay 动作作为蒸馏 teacher
+- `teacher_from_replay`：是否启用来自 EAS replay 的 teacher 蒸馏
 - `log_search_stats`：是否记录局部搜索统计
+- `eas_replay_capacity`：EAS replay 容量
+- `eas_batch_size`：EAS replay 训练 batch size
+- `filter_teacher_on_update`：是否在训练阶段按当前 critic 判断 teacher 是否仍占优
+- `teacher_compare_mode`：teacher 与当前 actor 动作的比较方式
 
 推荐初始值：
 
@@ -161,9 +203,11 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets_eas_local.py --output_dir outp
 
 - `distill_loss`
 - `search_change_rate`
-  - 局部搜索是否真的改写了 seed action
+  - 局部搜索是否真的改写了 teacher 候选
 - `search_avg_gain`
   - 局部搜索相对 seed action 的平均 Q 提升
+- `eas_valid_ratio`
+  - 训练阶段从 EAS replay 采样后，仍被当前 critic 认为优于 actor 动作、因此保留梯度的样本比例
 - 与 baseline 对比的：
   - mean step reward
   - mean BER
@@ -179,14 +223,15 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets_eas_local.py --output_dir outp
 - 不修改环境结构；
 - 不改变 10-step 顺序决策语义；
 - 不做联合 10-offset 搜索；
-- 不在 update 阶段重新搜索 teacher；
-- teacher 直接来自 replay 中的执行动作。
+- 执行动作始终来自 actor 采样；
+- 局部搜索结果只进入单独 EAS replay；
+- teacher 是否有效在 update 阶段动态过滤。
 
 如果后续需要进一步增强，可以再研究：
 
 - 更大的局部半径
 - top-k actor proposal + local reranking
-- update 阶段重新搜索 teacher
+- 更丰富的 teacher 过滤标准
 - sequence-level search / planner
 - soft target distillation 而不是 hard CE
 

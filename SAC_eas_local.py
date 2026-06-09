@@ -3,7 +3,7 @@ from torch import nn
 from torch.nn import functional as F
 import numpy as np
 
-from SAC import ReplayBuffer, PolicyNet, ValueNet
+from SAC import PolicyNet, ValueNet
 
 
 class SACEASLocal:
@@ -14,7 +14,9 @@ class SACEASLocal:
                  distill_coef=0.1,
                  search_eval="min_q",
                  teacher_from_replay=True,
-                 log_search_stats=True):
+                 log_search_stats=True,
+                 filter_teacher_on_update=True,
+                 teacher_compare_mode="min_q"):
         self.critic_1 = ValueNet(n_actions).to(device)
         self.critic_2 = ValueNet(n_actions).to(device)
         self.actor = PolicyNet(n_actions, extra_embedding_module=self.critic_1.extra_embedding).to(device)
@@ -44,6 +46,8 @@ class SACEASLocal:
         self.search_eval = search_eval
         self.teacher_from_replay = bool(teacher_from_replay)
         self.log_search_stats = bool(log_search_stats)
+        self.filter_teacher_on_update = bool(filter_teacher_on_update)
+        self.teacher_compare_mode = teacher_compare_mode
 
         self._reset_rollout_stats()
 
@@ -86,9 +90,10 @@ class SACEASLocal:
         candidates = sorted(set(range(lo, hi + 1)))
         return candidates
 
-    def _score_candidates(self, q1_values, q2_values, candidates):
-        if self.search_eval != "min_q":
-            raise ValueError(f"Unsupported search_eval: {self.search_eval}")
+    def _score_candidates(self, q1_values, q2_values, candidates, eval_mode=None):
+        eval_mode = eval_mode or self.search_eval
+        if eval_mode != "min_q":
+            raise ValueError(f"Unsupported search_eval: {eval_mode}")
         q_min = torch.min(q1_values, q2_values)
         candidate_scores = q_min[candidates]
         best_local_idx = torch.argmax(candidate_scores).item()
@@ -129,8 +134,9 @@ class SACEASLocal:
             self._search_changed += 1
         self._search_gain_sum += (best_score - seed_score)
 
-        return best_action, {
+        return seed_action, {
             "seed_action": int(seed_action),
+            "teacher_action": int(best_action),
             "selected_action": int(best_action),
             "search_gain": float(best_score - seed_score),
             "candidate_count": len(candidates),
@@ -156,7 +162,43 @@ class SACEASLocal:
         for param_target, param in zip(target_net.parameters(), net.parameters()):
             param_target.data.copy_(param_target.data * (1 - self.tau) + param.data * self.tau)
 
-    def update(self, transition_dict):
+    def _calc_eas_distill_loss(self, eas_transition_dict):
+        zero = torch.tensor(0.0, dtype=torch.float32, device=self.device)
+        if not self.teacher_from_replay or eas_transition_dict is None:
+            return zero, 0.0, 0
+
+        imgs = torch.tensor(eas_transition_dict['state_imgs'], dtype=torch.float32, device=self.device).unsqueeze(1)
+        extras = self._build_extra_tensor(eas_transition_dict['hoprates'], eas_transition_dict['action_arrs'])
+        teacher_actions = torch.tensor(eas_transition_dict['teacher_actions'], dtype=torch.long, device=self.device)
+
+        probs, logits = self.actor(imgs, extras)
+        ce_losses = F.cross_entropy(logits, teacher_actions, reduction='none')
+
+        q1_values = self.critic_1(imgs, extras)
+        q2_values = self.critic_2(imgs, extras)
+        _, current_actor_actions = torch.max(probs, dim=1)
+
+        compare_mode = self.teacher_compare_mode or self.search_eval
+        if compare_mode != "min_q":
+            raise ValueError(f"Unsupported teacher_compare_mode: {compare_mode}")
+        q_min = torch.min(q1_values, q2_values)
+        teacher_scores = q_min.gather(1, teacher_actions.view(-1, 1)).squeeze(1)
+        actor_scores = q_min.gather(1, current_actor_actions.view(-1, 1)).squeeze(1)
+
+        if self.filter_teacher_on_update:
+            valid_mask = teacher_scores > actor_scores
+        else:
+            valid_mask = torch.ones_like(teacher_scores, dtype=torch.bool)
+
+        valid_count = int(valid_mask.sum().item())
+        if valid_count <= 0:
+            return zero, 0.0, 0
+
+        masked_loss = ce_losses[valid_mask].mean()
+        valid_ratio = float(valid_count / teacher_actions.shape[0])
+        return masked_loss, valid_ratio, valid_count
+
+    def update(self, transition_dict, eas_transition_dict=None):
         imgs = torch.tensor(transition_dict['state_imgs'], dtype=torch.float32, device=self.device).unsqueeze(1)
         next_imgs = torch.tensor(transition_dict['next_state_imgs'], dtype=torch.float32, device=self.device).unsqueeze(1)
         extras = self._build_extra_tensor(transition_dict['hoprates'], transition_dict['action_arrs'])
@@ -179,7 +221,7 @@ class SACEASLocal:
         self.critic_1_optimizer.step()
         self.critic_2_optimizer.step()
 
-        probs, logits = self.actor(imgs, extras)
+        probs, _ = self.actor(imgs, extras)
         log_probs = torch.log(probs + 1e-8)
         entropy = -torch.sum(probs * log_probs, dim=1, keepdim=True)
 
@@ -188,9 +230,7 @@ class SACEASLocal:
         min_q = torch.sum(probs * torch.min(q1, q2), dim=1, keepdim=True)
         sac_actor_loss = torch.mean(-self.log_alpha.exp() * entropy - min_q)
 
-        distill_loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        if self.teacher_from_replay:
-            distill_loss = F.cross_entropy(logits, actions.squeeze(1))
+        distill_loss, eas_valid_ratio, eas_valid_count = self._calc_eas_distill_loss(eas_transition_dict)
 
         actor_loss = sac_actor_loss + self.distill_coef * distill_loss
         self.actor_optimizer.zero_grad()
@@ -213,4 +253,6 @@ class SACEASLocal:
             "distill_loss": distill_loss.item(),
             "alpha_loss": alpha_loss.item(),
             "alpha": float(self.log_alpha.exp().item()),
+            "eas_valid_ratio": eas_valid_ratio,
+            "eas_valid_count": eas_valid_count,
         }
