@@ -188,12 +188,19 @@ def train(args):
         plot_search_change_rate.append(search_stats.get('search_change_rate', 0))
         plot_eas_valid_ratio.append(train_stats.get('eas_valid_ratio', 0) if train_stats else 0)
 
+        if search_stats.get('search_total', 0) > 0:
+            search_change_text = f"{search_stats.get('search_change_rate', 0):.2%}"
+            search_gain_text = f"{search_stats.get('search_avg_gain', 0):.4f}"
+        else:
+            search_change_text = "N/A"
+            search_gain_text = "N/A"
+
         log_msg = (f"Step {step_idx}/{args.steps_per_episode} | "
                    f"Offsets: {offsets.astype(int).tolist()} | "
                    f"Rew: {mean_step_reward:.4f} | "
                    f"BER: {mean_step_ber:.4f} | "
-                   f"SearchChange: {search_stats.get('search_change_rate', 0):.2%} | "
-                   f"SearchGain: {search_stats.get('search_avg_gain', 0):.4f} | "
+                   f"SearchChange: {search_change_text} | "
+                   f"SearchGain: {search_gain_text} | "
                    f"EASBuf: {eas_buffer.size()}")
 
         if train_stats:

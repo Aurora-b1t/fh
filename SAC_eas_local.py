@@ -166,8 +166,17 @@ class SACEASLocal:
         }
 
     def take_action(self, state_img_np, hoprate, action_arr_np):
-        action, _ = self.local_search_action(state_img_np, hoprate, action_arr_np)
-        return action
+        img, extra = self._state_to_tensors(state_img_np, hoprate, action_arr_np)
+
+        actor_was_training = self.actor.training
+        self.actor.eval()
+        with torch.no_grad():
+            probs, _ = self.actor(img, extra)
+            probs = probs.squeeze(0)
+            action = torch.distributions.Categorical(probs).sample().item()
+        if actor_was_training:
+            self.actor.train()
+        return int(action)
 
     def calc_target(self, rewards, next_imgs, next_extras, dones):
         next_probs, _ = self.actor(next_imgs, next_extras)
