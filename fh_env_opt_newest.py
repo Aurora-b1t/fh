@@ -112,8 +112,8 @@ def compute_psd_waterfall(signal, fs, f_start, f_end,
         plt.xlabel('Time bin')
         plt.ylabel('Freq bin')
         title_str = 'PSD Waterfall ({:.0f} ms)'.format(max_duration * 1e3)
-        if plot_title:
-            title_str += f"\n{plot_title}"
+        #if plot_title:
+            #title_str += f"\n{plot_title}"
         plt.title(title_str)
         plt.tight_layout()
         plt.show()
@@ -731,7 +731,7 @@ class FHSSQPSKEnv(gym.Env):
                 plt.colorbar(label='PSD (dB)')
                 plt.xlabel('Time bin')
                 plt.ylabel('Freq bin')
-                title_str = 'PSD Waterfall (100 ms) [Pregen]'
+                title_str = 'PSD Waterfall (100 ms)'
                 if plot_title:
                     title_str += f"\n{plot_title}"
                 plt.title(title_str)

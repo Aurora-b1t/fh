@@ -1,7 +1,9 @@
 # settings.py
 import numpy as np
 
-# Logging
+# Logging and output
+# train_offsets_v1.py writes LOG_FILE and plots under OUTPUT_DIR.
+OUTPUT_DIR = "outputs/latest"
 LOG_FILE = "training_log.txt"
 
 # Device Configuration
@@ -30,7 +32,7 @@ ENV_CONFIG = {
 # Jammer Configuration
 JAMMER_CONFIG = {
     # Global Jamming Mode: 'sweep', 'comb', or 'both'
-    "mode": "both",
+    "mode": "comb",
     
     # Sweep Jamming Configuration
     "sweep": {
@@ -66,6 +68,15 @@ SAC_CONFIG = {
     "target_entropy_ratio": 0.9,
 }
 
+# EAS-style local neighborhood search SAC variant
+EAS_LOCAL_CONFIG = {
+    "search_radius": 1,
+    "distill_coef": 0.1,
+    "search_eval": "min_q",
+    "teacher_from_replay": True,
+    "log_search_stats": True,
+}
+
 # Replay Buffer Configuration
 BUFFER_CONFIG = {
     "capacity": 12000,
@@ -74,15 +85,16 @@ BUFFER_CONFIG = {
 
 # Training Loop Configuration
 TRAIN_CONFIG = {
-    "steps_per_episode": 1200,       # Total steps per episode
-    "min_buffer_before_train": 1200, # Warmup steps
+    "steps_per_episode": 2000,       # Total environment steps per episode
+    "min_buffer_before_train": 1200, # Warmup replay entries; each env step adds 10 entries
     "update_iters_per_step": 1,      # Gradient updates per environment step
     "fixed_hoprate": 200.0,          # Fixed hopping rate for training
 }
 
 # Reward Calculation Configuration
+# Matches FHSSQPSKEnv.step(): base_reward - BER * ber_penalty - hoprate * hoprate_penalty
 REWARD_CONFIG = {
-    "base_reward": 1.0,
-    "ber_penalty": 6.0,
-    "hoprate_penalty": 0.0, # Not used for fixed hoprate, but good to keep
+    "base_reward": 0.5,
+    "ber_penalty": 1.0,
+    "hoprate_penalty": 0,
 }

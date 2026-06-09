@@ -204,9 +204,15 @@ class SAC:
         img = torch.tensor(state_img_np, dtype=torch.float32, device=self.device).unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
         extra_np = np.concatenate(([hoprate], np.array(action_arr_np, dtype=np.float32))).astype(np.float32)  # [11]
         extra = torch.tensor(extra_np, dtype=torch.float32, device=self.device).unsqueeze(0)  # [1,11]
-        probs, _ = self.actor(img, extra)
-        action_dist = torch.distributions.Categorical(probs)
-        action = action_dist.sample().item()
+
+        was_training = self.actor.training
+        self.actor.eval()
+        with torch.no_grad():
+            probs, _ = self.actor(img, extra)
+            action_dist = torch.distributions.Categorical(probs)
+            action = action_dist.sample().item()
+        if was_training:
+            self.actor.train()
         return action
 
     # 一次“步”（一个 100x100 矩阵 + hoprate），顺序输出 10 个动作
@@ -287,7 +293,9 @@ class SAC:
         self.actor_optimizer.step()
 
         # 温度系数 alpha 更新
-        alpha_loss = torch.mean((entropy - self.target_entropy).detach() * self.log_alpha.exp())
+        # 离散 SAC 中 target_entropy 为正熵目标。最小化该 loss 时：
+        # entropy < target_entropy -> log_alpha 增大，鼓励探索；反之减小。
+        alpha_loss = torch.mean(self.log_alpha * (entropy.detach() - self.target_entropy))
         self.log_alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.log_alpha_optimizer.step()

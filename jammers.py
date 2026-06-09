@@ -260,12 +260,12 @@ class IndiscriminateJammer:
             # --- Optimized for 8 fixed points aligned to 50kHz channels ---
             sub_interval = 50000.0
             
-            # Hardcoded selection for 8 points per group out of ~20 channels
+            # Hardcoded selection for two alternating 8-channel comb groups.
             if self.comb_phase == 0:
-                # Group 0: [0, 3, 5, 8, 10, 13, 15, 18]
+                # Group 0: even channel indices
                 target_indices = np.array([0, 2, 4, 6, 8, 10, 12, 14])
             else:
-                # Group 1: [1, 4, 6, 9, 11, 14, 16, 19]
+                # Group 1: odd channel indices
                 target_indices = np.array([1, 3, 5, 7, 9, 11, 13, 15])
             
             # Map to frequencies: Start + k*sub + 0.5*sub

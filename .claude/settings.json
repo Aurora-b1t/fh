@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/d/Anaconda/envs/rl_fhss/python.exe\" train_offsets_eas_local.py --help)"
+    ]
+  }
+}
