@@ -109,12 +109,17 @@ def train(args):
 
         offsets = np.zeros(10, dtype=np.float32)
         action_arr_before = np.zeros(10, dtype=np.float32)
+        use_eas_rollout = buffer.size() >= args.min_buffer_before_train
 
         for i in range(10):
-            a_i, search_info = agent.local_search_action(state_img, fixed_hoprate, action_arr_before)
+            if use_eas_rollout:
+                a_i, search_info = agent.local_search_action(state_img, fixed_hoprate, action_arr_before)
+            else:
+                a_i = agent.take_action(state_img, fixed_hoprate, action_arr_before)
+                search_info = None
             a_i = int(np.clip(a_i, 0, n_actions - 1))
             offsets[i] = a_i
-            if search_info["teacher_action"] != search_info["seed_action"]:
+            if use_eas_rollout and search_info["teacher_action"] != search_info["seed_action"]:
                 eas_buffer.add(
                     state_img,
                     fixed_hoprate,

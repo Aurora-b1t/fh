@@ -75,7 +75,7 @@ EAS_LOCAL_CONFIG = {
     "search_eval": "min_q",
     "teacher_from_replay": True,
     "log_search_stats": True,
-    "eas_replay_capacity": 12000,
+    "eas_replay_capacity": 6000,
     "eas_batch_size": 256,
     "filter_teacher_on_update": True,
     "teacher_compare_mode": "min_q",
