@@ -134,7 +134,13 @@ class SACEASLocal:
             seed_score = float(q_min[seed_action].item())
             candidates = self.build_local_candidates(seed_action)
             if len(candidates) > 0:
-                best_action, best_score, _ = self._score_candidates(q1_values, q2_values, candidates)
+                best_candidate_action, best_candidate_score, _ = self._score_candidates(q1_values, q2_values, candidates)
+                if best_candidate_score > seed_score:
+                    best_action = int(best_candidate_action)
+                    best_score = float(best_candidate_score)
+                else:
+                    best_action = int(seed_action)
+                    best_score = seed_score
             else:
                 best_action = int(seed_action)
                 best_score = seed_score
