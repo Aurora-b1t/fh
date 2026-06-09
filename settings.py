@@ -65,13 +65,13 @@ SAC_CONFIG = {
     "alpha_lr": 1e-4,
     "tau": 0.005,
     "gamma": 0.99,
-    "target_entropy_ratio": 0.9,
+    "target_entropy_ratio": 0.1,
 }
 
 # EAS-style local neighborhood search SAC variant
 EAS_LOCAL_CONFIG = {
-    "search_radius": 1,
-    "distill_coef": 0.1,
+    "search_radius": 2,
+    "distill_coef": 0.5,
     "search_eval": "min_q",
     "teacher_from_replay": True,
     "log_search_stats": True,
@@ -89,7 +89,7 @@ BUFFER_CONFIG = {
 
 # Training Loop Configuration
 TRAIN_CONFIG = {
-    "steps_per_episode": 2000,       # Total environment steps per episode
+    "steps_per_episode": 1200,       # Total environment steps per episode
     "min_buffer_before_train": 1200, # Warmup replay entries; each env step adds 10 entries
     "update_iters_per_step": 1,      # Gradient updates per environment step
     "fixed_hoprate": 200.0,          # Fixed hopping rate for training
@@ -98,7 +98,7 @@ TRAIN_CONFIG = {
 # Reward Calculation Configuration
 # Matches FHSSQPSKEnv.step(): base_reward - BER * ber_penalty - hoprate * hoprate_penalty
 REWARD_CONFIG = {
-    "base_reward": 0.5,
-    "ber_penalty": 1.0,
+    "base_reward": 1.0,
+    "ber_penalty": 8.0,
     "hoprate_penalty": 0,
 }

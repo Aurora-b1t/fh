@@ -114,14 +114,15 @@ def train(args):
             a_i, search_info = agent.local_search_action(state_img, fixed_hoprate, action_arr_before)
             a_i = int(np.clip(a_i, 0, n_actions - 1))
             offsets[i] = a_i
-            eas_buffer.add(
-                state_img,
-                fixed_hoprate,
-                action_arr_before.copy(),
-                search_info["teacher_action"],
-                search_gain=search_info.get("search_gain", 0.0),
-                candidate_count=search_info.get("candidate_count", 0),
-            )
+            if search_info["teacher_action"] != search_info["seed_action"]:
+                eas_buffer.add(
+                    state_img,
+                    fixed_hoprate,
+                    action_arr_before.copy(),
+                    search_info["teacher_action"],
+                    search_gain=search_info.get("search_gain", 0.0),
+                    candidate_count=search_info.get("candidate_count", 0),
+                )
             if i < 10:
                 action_arr_before[i] = a_i
 

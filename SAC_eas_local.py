@@ -85,9 +85,21 @@ class SACEASLocal:
         return img, extra
 
     def build_local_candidates(self, seed_action):
-        lo = max(0, int(seed_action) - self.search_radius)
-        hi = min(self.n_actions - 1, int(seed_action) + self.search_radius)
-        candidates = sorted(set(range(lo, hi + 1)))
+        seed_action = int(seed_action)
+        if self.search_radius <= 0 or self.n_actions <= 1:
+            return []
+
+        candidates = []
+        seen = set()
+        for delta in range(1, self.search_radius + 1):
+            for candidate in (
+                (seed_action - delta) % self.n_actions,
+                (seed_action + delta) % self.n_actions,
+            ):
+                if candidate == seed_action or candidate in seen:
+                    continue
+                seen.add(candidate)
+                candidates.append(int(candidate))
         return candidates
 
     def _score_candidates(self, q1_values, q2_values, candidates, eval_mode=None):
@@ -118,9 +130,14 @@ class SACEASLocal:
 
             q1_values = self.critic_1(img, extra).squeeze(0)
             q2_values = self.critic_2(img, extra).squeeze(0)
-            candidates = self.build_local_candidates(seed_action)
-            best_action, best_score, q_min = self._score_candidates(q1_values, q2_values, candidates)
+            q_min = torch.min(q1_values, q2_values)
             seed_score = float(q_min[seed_action].item())
+            candidates = self.build_local_candidates(seed_action)
+            if len(candidates) > 0:
+                best_action, best_score, _ = self._score_candidates(q1_values, q2_values, candidates)
+            else:
+                best_action = int(seed_action)
+                best_score = seed_score
 
         if actor_was_training:
             self.actor.train()
