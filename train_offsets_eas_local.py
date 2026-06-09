@@ -7,7 +7,7 @@ import logging
 import matplotlib.pyplot as plt
 
 from fh_env_opt_newest import FHSSQPSKEnv
-from SAC import ReplayBuffer
+from SAC import ReplayBuffer, EASReplayBuffer
 from SAC_eas_local import SACEASLocal
 import settings
 
@@ -54,10 +54,13 @@ def build_agent_and_env(args):
         search_eval=args.search_eval,
         teacher_from_replay=args.teacher_from_replay,
         log_search_stats=args.log_search_stats,
+        filter_teacher_on_update=args.filter_teacher_on_update,
+        teacher_compare_mode=args.teacher_compare_mode,
     )
 
     buffer = ReplayBuffer(capacity=args.replay_size)
-    return env, agent, buffer, device, n_actions
+    eas_buffer = EASReplayBuffer(capacity=args.eas_replay_capacity)
+    return env, agent, buffer, eas_buffer, device, n_actions
 
 
 def compute_block_rewards(ber_blocks, hoprate):
@@ -77,7 +80,7 @@ def train(args):
     logger.info(f"Output directory: {args.output_dir}")
     logger.info(f"Log file: {log_path}")
 
-    env, agent, buffer, device, n_actions = build_agent_and_env(args)
+    env, agent, buffer, eas_buffer, device, n_actions = build_agent_and_env(args)
     fixed_hoprate = settings.TRAIN_CONFIG["fixed_hoprate"]
 
     logger.info(f"Start EAS-local SAC Training for 1 episode with {args.steps_per_episode} steps...")
@@ -97,6 +100,7 @@ def train(args):
     plot_losses_critic = []
     plot_losses_distill = []
     plot_search_change_rate = []
+    plot_eas_valid_ratio = []
 
     logger.info(f"--- Episode {episode} Start ---")
 
@@ -107,9 +111,17 @@ def train(args):
         action_arr_before = np.zeros(10, dtype=np.float32)
 
         for i in range(10):
-            a_i = agent.take_action(state_img, fixed_hoprate, action_arr_before)
+            a_i, search_info = agent.local_search_action(state_img, fixed_hoprate, action_arr_before)
             a_i = int(np.clip(a_i, 0, n_actions - 1))
             offsets[i] = a_i
+            eas_buffer.add(
+                state_img,
+                fixed_hoprate,
+                action_arr_before.copy(),
+                search_info["teacher_action"],
+                search_gain=search_info.get("search_gain", 0.0),
+                candidate_count=search_info.get("candidate_count", 0),
+            )
             if i < 10:
                 action_arr_before[i] = a_i
 
@@ -154,7 +166,10 @@ def train(args):
         if buffer.size() >= args.min_buffer_before_train:
             for _ in range(args.update_iters_per_step):
                 batch = buffer.sample(args.batch_size)
-                train_stats = agent.update(batch)
+                eas_batch = None
+                if args.teacher_from_replay and eas_buffer.size() >= args.eas_batch_size:
+                    eas_batch = eas_buffer.sample(args.eas_batch_size)
+                train_stats = agent.update(batch, eas_batch)
 
         search_stats = agent.consume_rollout_stats()
         step_duration = time.time() - step_start_time
@@ -165,19 +180,23 @@ def train(args):
         plot_losses_critic.append(train_stats.get('critic1_loss', 0) if train_stats else 0)
         plot_losses_distill.append(train_stats.get('distill_loss', 0) if train_stats else 0)
         plot_search_change_rate.append(search_stats.get('search_change_rate', 0))
+        plot_eas_valid_ratio.append(train_stats.get('eas_valid_ratio', 0) if train_stats else 0)
 
         log_msg = (f"Step {step_idx}/{args.steps_per_episode} | "
                    f"Offsets: {offsets.astype(int).tolist()} | "
                    f"Rew: {mean_step_reward:.4f} | "
                    f"BER: {mean_step_ber:.4f} | "
                    f"SearchChange: {search_stats.get('search_change_rate', 0):.2%} | "
-                   f"SearchGain: {search_stats.get('search_avg_gain', 0):.4f}")
+                   f"SearchGain: {search_stats.get('search_avg_gain', 0):.4f} | "
+                   f"EASBuf: {eas_buffer.size()}")
 
         if train_stats:
             log_msg += (f" | Loss: A={train_stats.get('actor_loss', 0):.3f}, "
                         f"C={train_stats.get('critic1_loss', 0):.3f}, "
                         f"D={train_stats.get('distill_loss', 0):.3f}, "
-                        f"Alpha={train_stats.get('alpha', 0):.5f}")
+                        f"Alpha={train_stats.get('alpha', 0):.5f}, "
+                        f"EASValid={train_stats.get('eas_valid_ratio', 0):.2%}, "
+                        f"EASCount={train_stats.get('eas_valid_count', 0)}")
 
         log_msg += f" | T: {step_duration:.2f}s"
         logger.info(log_msg)
@@ -228,12 +247,21 @@ def train(args):
         plt.savefig(os.path.join(args.output_dir, "search_change_rate.png"))
         plt.close()
 
+        plt.figure()
+        plt.plot(plot_eas_valid_ratio, label="EAS Valid Ratio", color='m')
+        plt.title("EAS Distillation Valid Ratio")
+        plt.xlabel("Step")
+        plt.ylabel("Ratio")
+        plt.grid(True)
+        plt.savefig(os.path.join(args.output_dir, "eas_valid_ratio.png"))
+        plt.close()
+
         logger.info(f"Plots saved to {args.output_dir}.")
     except Exception as e:
         logger.error(f"Plotting failed: {e}")
 
     total_duration = time.time() - start_time
-    logger.info(f"Total Time: {total_duration:.2f}s | Mean Ep Reward: {mean_ep_reward:.4f}")
+    logger.info(f"Total Time: {total_duration:.2f}s | Mean Ep Reward: {mean_ep_reward:.4f} | Episode Time: {time.time() - ep_start_time:.2f}s")
 
 
 def parse_args():
@@ -255,9 +283,14 @@ def parse_args():
     parser.add_argument("--no_teacher_from_replay", dest="teacher_from_replay", action="store_false")
     parser.add_argument("--log_search_stats", action="store_true", default=settings.EAS_LOCAL_CONFIG["log_search_stats"])
     parser.add_argument("--no_log_search_stats", dest="log_search_stats", action="store_false")
+    parser.add_argument("--filter_teacher_on_update", action="store_true", default=settings.EAS_LOCAL_CONFIG["filter_teacher_on_update"])
+    parser.add_argument("--no_filter_teacher_on_update", dest="filter_teacher_on_update", action="store_false")
+    parser.add_argument("--teacher_compare_mode", type=str, default=settings.EAS_LOCAL_CONFIG["teacher_compare_mode"])
 
     parser.add_argument("--replay_size", type=int, default=settings.BUFFER_CONFIG["capacity"])
     parser.add_argument("--batch_size", type=int, default=settings.BUFFER_CONFIG["batch_size"])
+    parser.add_argument("--eas_replay_capacity", type=int, default=settings.EAS_LOCAL_CONFIG["eas_replay_capacity"])
+    parser.add_argument("--eas_batch_size", type=int, default=settings.EAS_LOCAL_CONFIG["eas_batch_size"])
     parser.add_argument("--min_buffer_before_train", type=int, default=settings.TRAIN_CONFIG["min_buffer_before_train"])
     parser.add_argument("--update_iters_per_step", type=int, default=settings.TRAIN_CONFIG["update_iters_per_step"])
 
