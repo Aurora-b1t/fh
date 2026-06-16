@@ -1,4 +1,14 @@
+"""
+Jammer implementations for FHSS anti-jamming simulation.
+
+Includes a pre-generated band-limited noise source, an energy-detection based
+reactive jammer, and an indiscriminate sweep/comb jammer with optional
+pre-computed signal buffers.
+"""
+
 import numpy as np
+from scipy.stats import chi2, ncx2
+from scipy.special import roots_laguerre
 
 # -----------------------------
 # 快速噪声源
@@ -41,57 +51,224 @@ class FastNoiseSource:
 # 干扰机
 # -----------------------------
 class ReactiveJammer:
-    def __init__(self, Fs, speed=10.0, power=0.5, bandwidth=50000.0, noise_source=None):
+    """
+    Reactive jammer based on energy detection theory.
+
+    Reference:
+      Urkowitz, "Energy Detection of Unknown Deterministic Signals",
+      Proc. IEEE, vol. 55, no. 4, pp. 523–531, Apr. 1967.
+
+    Operates on a **1 ms fundamental time unit**:
+
+    * SCAN mode — scans one channel per 1 ms slot.  Energy detection
+      decides whether a signal is present:
+      - H0 (noise only):     V ~ χ²(2γ)        (central chi-square)
+      - H1 (signal present): V ~ χ²(2γ, λ)     (non-central, λ = 2·SNR·γ)
+      where γ = T·W is the time-bandwidth product.
+
+    * JAM mode — jams the detected channel for 1 ms, then re-scans
+      the **same** channel in the next slot.
+
+    Channel scan order: 0 → 1 → … → (num_channels-1) → 0 → …  (cyclic).
+
+    Jamming signals are pre-generated once per channel (20 possibilities).
+    """
+
+    def __init__(self, Fs, num_channels=20, sub_interval=50000.0,
+                 detection_time=0.001, p_fa=0.1,
+                 power=0.8, bandwidth=50000.0, Startfre=3e6,
+                 noise_source=None, speed=None,
+                 noise_std=0.1, signal_power=None, Baud=25000):
+        # ---- basic parameters ----
         self.Fs = float(Fs)
-        self.speed = float(speed)
+        self.num_channels = int(num_channels)
+        self.sub_interval = float(sub_interval)
+        self.detection_time = float(detection_time)
+        self.p_fa = float(p_fa)
         self.power = float(power)
         self.bandwidth = float(bandwidth)
-        # Shared noise source
+        self.Startfre = float(Startfre)
+        self.noise_std = float(noise_std)
+        # speed is kept for backward API compatibility; unused in new logic
+        self.speed = float(speed) if speed is not None else float('inf')
+
+        # ---- energy detection: time-bandwidth product & degrees of freedom ----
+        self.TW = self.detection_time * self.sub_interval          # γ = T·W
+        self.dof = 2.0 * self.TW                                   # 2γ
+
+        # ---- signal power (real RF, per sample, PRE-fading) ----
+        if signal_power is not None:
+            self.signal_power = float(signal_power)
+        else:
+            # theoretical default: Baud / Fs
+            self.signal_power = float(Baud) / self.Fs
+
+        # ---- noise power in detection bandwidth W = Sub_interval ----
+        # N0 (one-sided PSD)  = 2 · σ² / Fs
+        # P_n = N0 · W = 2 · σ² · Sub_interval / Fs
+        noise_power_in_band = 2.0 * self.noise_std**2 * self.sub_interval / self.Fs
+
+        # ---- average SNR (PRE-fading) ----
+        self.snr_avg_linear = self.signal_power / max(noise_power_in_band, 1e-30)
+        self.snr_avg_dB = 10.0 * np.log10(max(self.snr_avg_linear, 1e-30))
+
+        # ---- threshold V_T from false-alarm probability (central χ²) ----
+        self.V_T = chi2.ppf(1.0 - self.p_fa, self.dof)
+
+        # ---- detection probability P_D, averaged over Rayleigh fading ----
+        # Instantaneous SNR: γ = SNR_avg · r²  where r² ~ Exp(1)
+        # P_D_faded = ∫₀^∞ [1 − F_{ncχ²}(V_T | dof, 2·SNR_avg·x·TW)] · e⁻ˣ dx
+        # Evaluated via Gauss–Laguerre quadrature.
+        self.P_D = self._fading_averaged_P_D(n_laguerre=50)
+
+        # ---- noise source & pre-generated jamming signals ----
         if noise_source is None:
             self.noise_source = FastNoiseSource(Fs, bandwidth)
         else:
             self.noise_source = noise_source
 
-    def generate(self, t, hop_seq, Startfre, Sub_interval, hoprate):
-        N = len(t)
-        if hoprate > self.speed or N == 0:
-            return np.zeros_like(t), False
+        self.samples_per_ms = max(1, int(self.Fs * self.detection_time))
+        self._pregenerate_jam_signals()
 
-        # Use fast noise source
-        raw_noise = self.noise_source.get_noise(N)
-        baseband_noise = raw_noise * self.power
+        # ---- state machine ----
+        self.reset()
 
+    # ------------------------------------------------------------------
+    def _fading_averaged_P_D(self, n_laguerre=50):
+        """
+        Compute P_D averaged over Rayleigh fading.
+
+        Rayleigh magnitude r has E[r²] = 1 (scale = √2/2).
+        r² ~ Exp(1), so the instantaneous SNR = SNR_avg · r² where r² ~ Exp(1).
+
+        P_D_faded = ∫₀^∞ P_D(x · SNR_avg) · e⁻ˣ dx
+
+        Evaluated with Gauss–Laguerre quadrature:
+            ∫₀^∞ f(x)·e⁻ˣ dx ≈ Σ w_i · f(x_i)
+        """
+        nodes, weights = roots_laguerre(n_laguerre)
+        p_d = 0.0
+        for x_i, w_i in zip(nodes, weights):
+            snr_inst = self.snr_avg_linear * x_i
+            lam = 2.0 * snr_inst * self.TW
+            p_d_inst = 1.0 - ncx2.cdf(self.V_T, self.dof, lam)
+            p_d += w_i * p_d_inst
+        return float(np.clip(p_d, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
+    def _pregenerate_jam_signals(self):
+        """
+        Pre-generate one 1-ms jamming segment per channel.
+
+        Jamming signal = band-limited noise × cos(2π·f_c·t).
+        Stored as float32 arrays keyed by channel index.
+        """
+        self._jam_cache = {}
+        t_1ms = np.arange(self.samples_per_ms, dtype=np.float64) / self.Fs
+        noise_1ms = self.noise_source.get_noise(self.samples_per_ms) * self.power
+
+        for k in range(self.num_channels):
+            f_c = self.Startfre + k * self.sub_interval + 0.5 * self.sub_interval
+            carrier = np.cos(2.0 * np.pi * f_c * t_1ms)
+            self._jam_cache[k] = (noise_1ms * carrier).astype(np.float32)
+
+    # ------------------------------------------------------------------
+    def reset(self):
+        """Reset state machine: start scanning channel 0."""
+        self.current_channel = 0
+        self.state = 'scan'          # 'scan' | 'jam'
+
+    # ------------------------------------------------------------------
+    def _get_tx_channel(self, sample_pos, hop_seq, hoprate):
+        """
+        Return the transmitter's channel index at a given sample position.
+
+        Uses the hopping sequence and per-hop duration to locate the
+        active hop, then reads the channel from ``hop_seq``.
+        """
+        if len(hop_seq) == 0:
+            return -1
         s_per_hop = self.Fs / float(hoprate)
-        jam = np.zeros(N)
-        pos = 0
-        k = 0
-        
-        phase_k = 2 * np.pi / self.Fs
+        if s_per_hop <= 0.0:
+            return int(hop_seq[0])
+        hop_idx = int(sample_pos / s_per_hop)
+        hop_idx = min(hop_idx, len(hop_seq) - 1)
+        return int(hop_seq[hop_idx])
 
-        while pos < N and k < len(hop_seq):
-            next_pos = int(round((k + 1) * s_per_hop))
-            next_pos = min(N, max(pos + 1, next_pos))
-            length = next_pos - pos
-            
-            f_c = Startfre + hop_seq[k] * Sub_interval + 0.5 * Sub_interval
-            
-            t_seg_local = np.arange(length) 
-            carrier = np.cos((phase_k * f_c) * t_seg_local)
-            
-            jam[pos:next_pos] = baseband_noise[pos:next_pos] * carrier
-            
-            pos = next_pos
-            k += 1
-            
-        if pos < N:
-            last_idx = max(0, min(k - 1, len(hop_seq) - 1))
-            f_last = Startfre + hop_seq[last_idx] * Sub_interval + 0.5 * Sub_interval
-            length = N - pos
-            t_seg_local = np.arange(length)
-            carrier = np.cos((phase_k * f_last) * t_seg_local)
-            jam[pos:] = baseband_noise[pos:] * carrier
-            
-        return jam, True
+    # ------------------------------------------------------------------
+    def _energy_detect(self, signal_present):
+        """
+        Simulate one energy-detection trial.
+
+        Parameters
+        ----------
+        signal_present : bool
+            ``True`` when the transmitter is on the channel being scanned.
+
+        Returns
+        -------
+        bool
+            ``True`` if the energy detector reports a detection.
+        """
+        p = self.P_D if signal_present else self.p_fa
+        return np.random.random() < p
+
+    # ------------------------------------------------------------------
+    def generate(self, t, hop_seq, Startfre, Sub_interval, hoprate):
+        """
+        Generate reactive jamming for one block.
+
+        The block is divided into 1-ms slots.  In each slot the internal
+        state machine decides whether to scan (and possibly transition to
+        jam) or to jam (and then return to scan on the same channel).
+
+        Returns
+        -------
+        jam : ndarray (float32, same length as *t*)
+            Jamming waveform (zero where no jamming occurred).
+        active : bool
+            ``True`` if at least one 1-ms slot in this block was jammed.
+        """
+        N = len(t)
+        if N == 0:
+            return np.zeros_like(t, dtype=np.float32), False
+
+        jam = np.zeros(N, dtype=np.float32)
+        any_jam = False
+
+        pos = 0
+        while pos < N:
+            seg_end = min(pos + self.samples_per_ms, N)
+            seg_len = seg_end - pos
+
+            # --- transmitter channel during this 1-ms slot ---
+            tx_channel = self._get_tx_channel(pos, hop_seq, hoprate)
+
+            if self.state == 'scan':
+                # energy detection on the current scanning channel
+                signal_present = (tx_channel == self.current_channel)
+                if self._energy_detect(signal_present):
+                    # detected → jam the same channel next slot
+                    self.state = 'jam'
+                else:
+                    # not detected → advance to next channel, keep scanning
+                    self.current_channel = (self.current_channel + 1) % self.num_channels
+
+            elif self.state == 'jam':
+                # output pre-generated jamming signal for current channel
+                ch = self.current_channel % self.num_channels
+                cached = self._jam_cache[ch]
+                if seg_len >= len(cached):
+                    jam[pos:pos + len(cached)] = cached
+                else:
+                    jam[pos:seg_end] = cached[:seg_len]
+                any_jam = True
+                # after jamming, re-scan the same channel
+                self.state = 'scan'
+
+            pos = seg_end
+
+        return jam, any_jam
 
 
 class IndiscriminateJammer:

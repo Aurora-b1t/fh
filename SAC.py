@@ -1,3 +1,10 @@
+"""
+Discrete-action Soft Actor-Critic (SAC) with convolutional state encoder.
+
+Defines replay buffers, CNN-based policy and Q networks, and the baseline
+SAC agent used for 10-offset FHSS anti-jamming training.
+"""
+
 import torch
 from torch import nn
 from torch.nn import functional as F

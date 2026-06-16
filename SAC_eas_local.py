@@ -1,3 +1,10 @@
+"""
+EAS local-neighborhood-search variant of discrete SAC.
+
+Extends baseline SAC with critic-guided local action search during rollout and
+teacher-action distillation during updates via a separate EAS replay buffer.
+"""
+
 import torch
 from torch import nn
 from torch.nn import functional as F

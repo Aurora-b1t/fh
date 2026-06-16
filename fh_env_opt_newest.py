@@ -1,3 +1,13 @@
+"""
+FHSS/QPSK anti-jamming Gymnasium environment.
+
+Provides the communication simulation chain: QPSK modulation/demodulation,
+FHSS channel with Rayleigh fading, pre-generated data acceleration, PSD
+waterfall observations, and support for reactive energy-detection and
+indiscriminate sweep/comb jammers. The environment exposes a 10-offset
+sequential decision interface for RL agents.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
 from commpy.filters import rrcosfilter
@@ -112,8 +122,6 @@ def compute_psd_waterfall(signal, fs, f_start, f_end,
         plt.xlabel('Time bin')
         plt.ylabel('Freq bin')
         title_str = 'PSD Waterfall ({:.0f} ms)'.format(max_duration * 1e3)
-        #if plot_title:
-            #title_str += f"\n{plot_title}"
         plt.title(title_str)
         plt.tight_layout()
         plt.show()
@@ -180,14 +188,13 @@ class PreGeneratedData:
         self.common_I = self.common_I.astype(dtype)
         self.common_Q = self.common_Q.astype(dtype)
         
-        # 3. Channel Pool [num_channels, block_len] (Complex)
-        # We store the FULL RF signal (Modulated + Noise + Rayleigh) for each channel
-        self.pool_rf = np.zeros((self.num_channels, self.block_len), dtype=np.complex64)
-        
-        # 4. Pure Carrier Pool [num_channels, block_len] (Complex)
-        # Needed for Receiver Demodulation
-        self.pool_carrier = np.zeros((self.num_channels, self.block_len), dtype=np.complex64)
-        
+        # 3. Per-channel faded baseband (complex) [num_channels, block_len]
+        #    = (common_I + j*common_Q) * ray_mag  — pre-computed for speed
+        self.pool_baseband = np.zeros((self.num_channels, self.block_len), dtype=np.complex64)
+
+        # 4. Per-channel thermal noise [num_channels, block_len]
+        self.pool_noise = np.zeros((self.num_channels, self.block_len), dtype=np.float32)
+
         # 5. Observations Buffer
         dummy_obs_sig = np.zeros(int(0.1 * env.Fs))
         dummy_wf = compute_psd_waterfall(dummy_obs_sig, env.Fs, env.Startfre, env.Endfre, 
@@ -199,91 +206,28 @@ class PreGeneratedData:
         print("Pre-generation complete.")
 
     def _generate_content(self):
-        # Time array for one block
-        t_block = np.arange(self.block_len) / self.env.Fs
-        
         # ---------------------------
-        # Part A: Generate Channel Pool
+        # Part A: Generate per-channel faded baseband & noise
         # ---------------------------
-        print("Optimizing: Generating Carrier & RF Pool...")
-        
-        # Pre-calc constants
-        Sub_interval = self.env.Sub_interval
-        Startfre = self.env.Startfre
-        Fs = self.env.Fs
-        
-        # Baseband complex
-        baseband = self.common_I + 1j * self.common_Q
-        
-        for k in range(self.num_channels):
-            # Calculate Center Frequency for Channel k
-            # Note: channel index k maps to frequency
-            f_c = Startfre + k * Sub_interval + 0.5 * Sub_interval
-            
-            # Generate Continuous Carrier for this block
-            # Note: phase starts at 0 for each block (simplification for pre-gen).
-            # This means phase discontinuity at block boundaries if reusing blocks, 
-            # but user accepted "using corresponding block".
-            carrier = np.exp(1j * 2 * np.pi * f_c * t_block)
-            self.pool_carrier[k] = carrier.astype(np.complex64)
-            
-            # Mix Baseband -> RF
-            rf_clean = baseband * carrier
-            
-            # Generate Noise
-            # Each channel gets independent noise instance? 
-            # Or distinct noise per channel-block? Yes, random call.
-            noise = 0.1 * (np.random.randn(self.block_len) + 1j * np.random.randn(self.block_len))
-            # Note: The original code used real noise added to real part of signal?
-            # Original: rf_complex = baseband * carrier; noise = 0.1 * randn(len) -> Real valued noise usually added to transmission?
-            # FHSSChannel.transmit returns rf_complex + noise (real array if noise is real? No, rf is complex).
-            # Let's check FHSSChannel.transmit:
-            # noise = noise_std * np.random.randn(len(rf_complex))
-            # return rf_complex, noise
-            # It returns tuple. The noise is REAL.
-            # In step(): rx_real = np.real(rf_complex * rayleigh) + jam + noise
-            # So we separate noise.
-            
-            # Revised Plan: Store RF (Clean Modulated) and Noise Separately? 
-            # Or Pre-mix?
-            # "each block respectively applies Rayleigh and White Noise"
-            # If we pre-mix, we freeze the noise instance for Channel K.
-            # This is what requested.
-            
-            noise_real = 0.1 * np.random.randn(self.block_len)
-            
-            # Rayleigh
-            if self.env.enable_rayleigh:
-                 ray_mag = self.env._generate_rayleigh(self.block_len)
-                 if ray_mag is None: ray_mag = 1.0
-            else:
-                 ray_mag = 1.0
-                 
-            # Combine for Final Pool Element:
-            # We need RX Real signal for processing.
-            # RX = Real(RF * Ray) + Noise
-            # We can pre-calculate this "Channel Response"
-            # But wait, Receiver needs `carrier_complex`.
-            
-            # Let's store the components to be flexible or pre-calc final RX_real
-            # We want to save computation during step.
-            # We can store:
-            # 1. Modulated Complex (with Ray applied? No, ray applies to RF).
-            # RF_faded = (Baseband * Carrier) * Ray
-            # RX_component = Real(RF_faded) + Noise
-            
-            rf_faded = rf_clean * ray_mag
-            rx_static = np.real(rf_faded) + noise_real
-            
-            self.pool_rf[k] = rx_static.astype(np.complex64) # Storing as complex to be safe? No, rx is real.
-                                                             # But pool is initialized as complex64. 
-                                                             # Let's cast to complex (imag=0) or change init.
-                                                             # To save memory, let's just make pool_rf float32?
-                                                             # Actually, self.pool_rf was init as complex64.
-                                                             # Let's re-init as float32 in __init__? 
-                                                             # No, I can just store in real part.
+        print("Optimizing: Generating baseband*ray & noise pool...")
 
-        self.pool_rf = np.real(self.pool_rf).astype(np.float32)
+        baseband = (self.common_I + 1j * self.common_Q).astype(np.complex64)
+        noise_std = getattr(self.env, 'noise_std', 0.1)
+
+        for k in range(self.num_channels):
+            # Rayleigh fading per channel
+            if self.env.enable_rayleigh:
+                ray_mag = self.env._generate_rayleigh(self.block_len)
+                if ray_mag is None:
+                    ray_mag = np.ones(self.block_len, dtype=np.float32)
+            else:
+                ray_mag = np.ones(self.block_len, dtype=np.float32)
+
+            # Store faded baseband: (I + jQ) * ray  (carrier modulation deferred to get_block)
+            self.pool_baseband[k] = (baseband * ray_mag.astype(np.complex64))
+
+            # Thermal noise per channel (real, std from env.noise_std)
+            self.pool_noise[k] = (noise_std * np.random.randn(self.block_len)).astype(np.float32)
 
         # ---------------------------
         # Part B: Observation Buffer (Legacy support for Jammers)
@@ -320,10 +264,10 @@ class PreGeneratedData:
             # Advance ptr by observation length
             obs_jammer_ptr += N_obs
 
-            noise_obs = 0.1 * np.random.randn(len(t_obs_template))
+            noise_obs = noise_std * np.random.randn(len(t_obs_template))
             sig_obs = jam_obs + noise_obs
-            
-            wf = compute_psd_waterfall(sig_obs, self.env.Fs, self.env.Startfre, self.env.Endfre, 
+
+            wf = compute_psd_waterfall(sig_obs, self.env.Fs, self.env.Startfre, self.env.Endfre,
                                          dt=self.env.dt, df=self.env.df, max_duration=0.1, plot=False)
             self.obs_buffer[0] = wf.astype(np.float32)
 
@@ -344,11 +288,11 @@ class PreGeneratedData:
                     jam_obs = self.env.sweep.get_composite_signal(obs_jammer_ptr, N_obs)
                 else:
                     jam_obs, _ = self.env.sweep.generate(t_obs_template, self.env.Startfre, self.env.Endfre)
-            
+
             # Advance ptr by observation length
             obs_jammer_ptr += N_obs
-            
-            noise_obs = 0.1 * np.random.randn(len(t_obs_template))
+
+            noise_obs = noise_std * np.random.randn(len(t_obs_template))
             sig_obs = jam_obs + noise_obs
             
             wf = compute_psd_waterfall(sig_obs, self.env.Fs, self.env.Startfre, self.env.Endfre, 
@@ -362,56 +306,81 @@ class PreGeneratedData:
 
     def get_block(self, hop_seq):
         """
-        Assemble a signal block from the pre-generated pool based on hopping sequence.
+        Assemble a signal block from the pre-generated pool.
+
+        Uses a **phase-continuous** carrier generated on the fly (same algorithm
+        as ``FHSSChannel.hop_carrier``), while the expensive baseband * Rayleigh
+        product and thermal noise are pre-computed per channel.
+
+        Processing is done per-hop to keep working sets cache-resident (~20k
+        samples per hop) and avoid large intermediate array allocations.
         """
-        # Output buffers
-        rx_assembled = np.zeros(self.block_len, dtype=np.float32)
-        carrier_assembled = np.zeros(self.block_len, dtype=np.complex64)
-        
-        # Calculate segments based on hop sequence
-        # We assume uniform hop duration within the block for simplification of slicing
-        # Total hops in this seq?
-        n_hops = len(hop_seq)
-        
-        # If n_hops > 0
-        samples_per_hop = self.block_len // n_hops
-        
-        # We need to be careful with rounding if simple division.
-        # But FHSSChannel.hop_carrier does logic based on `s_per_hop`.
-        # To match EXACTLY, we should replicate that logic index-wise.
-        
-        s_per_hop_float = self.env.Fs / float(self.env.current_hoprate)
-        
-        pos = 0
-        k = 0
         N = self.block_len
-        
-        while pos < N and k < n_hops:
-            # Determine end position for this hop
+        n_hops = len(hop_seq)
+        if n_hops == 0 or N == 0:
+            return (np.zeros(N, dtype=np.float32),
+                    np.zeros(N, dtype=np.complex64),
+                    self.common_bits)
+
+        s_per_hop_float = self.env.Fs / float(self.env.current_hoprate)
+        two_pi_over_Fs = 2.0 * np.pi / self.env.Fs
+
+        rx_assembled = np.empty(N, dtype=np.float32)
+        carrier_assembled = np.empty(N, dtype=np.complex64)
+
+        pos = 0
+        # cumsum_end = Σ f[i] for i = 0 … (pos-1), i.e. the cumulative sum
+        # up to the sample just before the current hop.  The carrier phase
+        # at sample n is  2π/Fs · (cumsum_end + f_curr · (n-pos+1)).
+        cumsum_end = 0.0
+
+        for k in range(n_hops):
             next_pos = int(round((k + 1) * s_per_hop_float))
             next_pos = min(N, max(pos + 1, next_pos))
-            
-            # The channel index
-            ch_idx = hop_seq[k]
-            ch_idx = ch_idx % self.num_channels # Safety
-            
-            # Slice from Pool
-            # Crucially: We take the [pos:next_pos] slice from the Pool
-            # This preserves the time-domain properties (e.g. if Rayleigh was varying)
-            # EXCEPT phase continuity at boundaries is determined by the Pool's carrier generation method.
-            # Since Pool carriers are continuous `exp(jwt)`, slicing preserves phase of THAT frequency relative to t=0.
-            
-            rx_assembled[pos:next_pos] = self.pool_rf[ch_idx, pos:next_pos]
-            carrier_assembled[pos:next_pos] = self.pool_carrier[ch_idx, pos:next_pos]
-            
+            length = next_pos - pos
+            if length <= 0:
+                continue
+
+            ch_idx = int(hop_seq[k]) % self.num_channels
+            f_c = (self.env.Startfre + ch_idx * self.env.Sub_interval
+                   + 0.5 * self.env.Sub_interval)
+
+            # t = [1, 2, …, length]  →  phase = 2π/Fs · (cumsum_end + f_c · t)
+            t_local = np.arange(1, length + 1, dtype=np.float64)
+            phase = two_pi_over_Fs * (cumsum_end + f_c * t_local)
+            carrier_hop = np.exp(1j * phase).astype(np.complex64)
+
+            cumsum_end += f_c * length  # now holds Σf up to last sample of this hop
+
+            # slice pre-computed baseband*ray and noise for this channel
+            bb_ray = self.pool_baseband[ch_idx, pos:next_pos]
+            noise = self.pool_noise[ch_idx, pos:next_pos]
+
+            # modulate: rx = Real(baseband_ray * carrier) + noise
+            rx_hop = np.real(bb_ray * carrier_hop)
+            rx_hop += noise
+
+            rx_assembled[pos:next_pos] = rx_hop
+            carrier_assembled[pos:next_pos] = carrier_hop
             pos = next_pos
-            k += 1
-            
-        # Handle remaining if any (last hop extends)
+
+        # handle any remainder
         if pos < N:
-             ch_idx = hop_seq[min(k, n_hops-1)] % self.num_channels
-             rx_assembled[pos:] = self.pool_rf[ch_idx, pos:]
-             carrier_assembled[pos:] = self.pool_carrier[ch_idx, pos:]
+            ch_idx = int(hop_seq[min(k, n_hops - 1)]) % self.num_channels
+            f_c = (self.env.Startfre + ch_idx * self.env.Sub_interval
+                   + 0.5 * self.env.Sub_interval)
+            length = N - pos
+            t_local = np.arange(1, length + 1, dtype=np.float64)
+            phase = two_pi_over_Fs * (cumsum_end + f_c * t_local)
+            carrier_hop = np.exp(1j * phase).astype(np.complex64)
+
+            bb_ray = self.pool_baseband[ch_idx, pos:]
+            noise = self.pool_noise[ch_idx, pos:]
+            rx_hop = np.real(bb_ray * carrier_hop)
+            rx_hop += noise
+
+            rx_assembled[pos:] = rx_hop
+            carrier_assembled[pos:] = carrier_hop
 
         return rx_assembled, carrier_assembled, self.common_bits
 
@@ -569,7 +538,9 @@ class FHSSQPSKEnv(gym.Env):
                  debug_log_hops=False,
                  reset_mseq_each_step=True,
                  use_pregen=True,
-                 pregen_steps=44):
+                 pregen_steps=44,
+                 noise_std=0.1,
+                 signal_power=0.0025):
         super().__init__()
 
         self.Startfre = float(Startfre)
@@ -600,14 +571,24 @@ class FHSSQPSKEnv(gym.Env):
 
         # 加载配置
         j_conf = settings.JAMMER_CONFIG
+        self.noise_std = float(noise_std)
+        self.signal_power = float(signal_power)
 
         if self.enable_reactive:
             r_conf = j_conf['reactive']
             self.reactive = ReactiveJammer(Fs=self.Fs,
-                                           speed=r_conf['speed'],
+                                           num_channels=self.num_channels,
+                                           sub_interval=self.Sub_interval,
+                                           detection_time=r_conf.get('detection_time', 0.001),
+                                           p_fa=r_conf.get('p_fa', 0.1),
                                            power=r_conf['power'],
                                            bandwidth=r_conf['bandwidth'],
-                                           noise_source=None)
+                                           Startfre=self.Startfre,
+                                           noise_source=None,
+                                           speed=r_conf.get('speed', None),
+                                           noise_std=self.noise_std,
+                                           signal_power=self.signal_power,
+                                           Baud=self.Baud)
         else:
             self.reactive = None
                                        
@@ -708,11 +689,8 @@ class FHSSQPSKEnv(gym.Env):
         return mag_seq
 
     def _observe_100ms(self, block_id=None):
-        # Optimized: If PreGeneratedData is available, use it directly
+        # Pre-generated observation path
         if self.use_pregen and self.pregen_data is not None:
-             # Just return pre-computed Obs
-             # Note: block_id is usually None or passed for debug string. 
-             # The step index drives the lookup.
              obs = self.pregen_data.get_observation(self.current_step)
              
              # Update jammer_ptr to simulate time passage (0.1s)
@@ -756,7 +734,7 @@ class FHSSQPSKEnv(gym.Env):
                 t_obs = np.arange(N_obs) / self.Fs
                 sweep_jam, _ = self.sweep.generate(t_obs, self.Startfre, self.Endfre)
 
-        noise = 0.1 * np.random.randn(N_obs)
+        noise = self.noise_std * np.random.randn(N_obs)
         obs_signal = sweep_jam + noise
 
         plot_title = ""
@@ -801,6 +779,10 @@ class FHSSQPSKEnv(gym.Env):
         # Reset Comb State
         if self.enable_sweep and self.sweep is not None:
              self.sweep.reset_comb()
+
+        # Reset Reactive Jammer state machine
+        if self.enable_reactive and self.reactive is not None:
+            self.reactive.reset()
 
         obs = self._observe_100ms(block_id=0)
         self.observation_space = spaces.Box(
@@ -864,10 +846,9 @@ class FHSSQPSKEnv(gym.Env):
                 # Reactive Jammer needs Pure Carrier (to sync phase) or just frequency knowledge.
                 # pregen_data.get_block returns (rx_signal_static, pure_carrier_for_rx, bits)
                 rx_static, carrier_complex, bits_block = self.pregen_data.get_block(hop_seq_block)
-                # print(f"Pool Assembly time: {end_time1 - start_time1:.4f} s")
-                
+
                 # t_block is needed for Reactive/Jammer
-                if b == 0: # optimize: t_block is const size usually
+                if b == 0:
                      self._t_block_cache = np.arange(len(rx_static)) / self.Fs
                 t_block = self._t_block_cache
                 
@@ -905,12 +886,9 @@ class FHSSQPSKEnv(gym.Env):
 
                 t_block = np.arange(len(I_pulse)) / self.Fs
                 
-                start_time1=time.time()
                 carrier_complex = self.channel.hop_carrier(t_block, hop_seq_block)
-                end_time1=time.time()
-                # print(f"Carrier generation time: {end_time1 - start_time1:.4f} s")
-                
-                rf_complex, noise = self.channel.transmit(I_pulse, Q_pulse, carrier_complex, noise_std=0.1)
+
+                rf_complex, noise = self.channel.transmit(I_pulse, Q_pulse, carrier_complex, noise_std=self.noise_std)
 
                 rayleigh_mag = self._generate_rayleigh(len(I_pulse))
                 if rayleigh_mag is None:
@@ -943,10 +921,6 @@ class FHSSQPSKEnv(gym.Env):
             _, ber = self.receiver.demodulate(rx_real, bits_block, carrier_complex)
             ber_blocks.append(float(ber))
             reactive_active_blocks.append(bool(reactive_active))
-
-            #end_time = time.time()
-            #print(f"Block {b+1} processing time: {end_time - start_time:.4f} s")
-
 
             if self.debug_plot_psd:
                 compute_psd_waterfall(
@@ -1007,9 +981,8 @@ class FHSSQPSKEnv(gym.Env):
 if __name__ == "__main__":
     pr_start = time.time()
     # Note: Jammer configuration is now loaded from settings.py
-    env = FHSSQPSKEnv(enable_reactive=False,
-                      enable_sweep=True,
-                      # sweep_mode='both',  <-- Ignored, controlled by settings.JAMMER_CONFIG['mode']
+    env = FHSSQPSKEnv(enable_reactive=True,
+                      enable_sweep=False,
                       enable_rayleigh=True,
                       debug_plot_psd=True,
                       debug_log_hops=False,
@@ -1020,7 +993,7 @@ if __name__ == "__main__":
     obs, info = env.reset()
 
     offsets = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
-    action = {"hoprate": 120.0, "offsets": offsets}
+    action = {"hoprate": 500.0, "offsets": offsets}
     for i in range(2):
         obs, reward, terminated, truncated, info = env.step(action)
         print(f"Step {i+1}: Reward: {reward}, Mean BER: {info['mean_ber']}")

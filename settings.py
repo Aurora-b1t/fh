@@ -1,9 +1,16 @@
-# settings.py
+"""
+Central configuration for the FHSS RL anti-jamming training project.
+
+Defines output directories, environment parameters, jammer settings, SAC and
+EAS-local hyperparameters, replay buffer sizes, noisy binary search settings,
+training loop options, and reward coefficients.
+"""
+
 import numpy as np
 
 # Logging and output
 # train_offsets_v1.py writes LOG_FILE and plots under OUTPUT_DIR.
-OUTPUT_DIR = "outputs/latest"
+OUTPUT_DIR = "outputs/latest/0.1ms"
 LOG_FILE = "training_log.txt"
 
 # Device Configuration
@@ -26,7 +33,13 @@ ENV_CONFIG = {
     "debug_plot_psd": False,
     "debug_log_hops": False,
     "use_pregen": True,
-    "pregen_steps": 44          # Align with 4.4s cycle (0.1s step)
+    "pregen_steps": 44,         # Align with 4.4s cycle (0.1s step)
+    "noise_std": 0.1,           # Thermal noise std at receiver (also used by reactive jammer)
+    # Real RF signal power per sample (before fading).
+    # Theoretical: Baud / Fs = 25000 / 1e7 = 0.0025.
+    # The reactive jammer uses this together with noise_std to derive its
+    # detection SNR, averaged over Rayleigh fading via Gauss-Laguerre quadrature.
+    "signal_power": 0.0025,
 }
 
 # Jammer Configuration
@@ -51,10 +64,16 @@ JAMMER_CONFIG = {
     },
     
     # Reactive Jamming Configuration
+    # Based on energy detection theory (Urkowitz 1967).
+    # Operates on 1 ms fundamental time slots: scan → detect → jam → re-scan.
+    # SNR at the jammer is derived from ENV_CONFIG["noise_std"] and the
+    # theoretical signal power (Baud / Fs), ensuring consistency with the receiver.
     "reactive": {
-        "speed": 160.0,
-        "power": 0.8,
-        "bandwidth": 50000.0,
+        "speed": 700.0,            # (unused in new energy-detection logic; kept for compatibility)
+        "power": 1.5,              # Jamming power factor
+        "bandwidth": 50000.0,      # Noise bandwidth (Hz)
+        "p_fa": 0.1,               # False-alarm probability for energy detection
+        "detection_time": 0.0001,   # Detection / jamming slot duration (s) — 1 ms
     }
 }
 
@@ -85,6 +104,18 @@ EAS_LOCAL_CONFIG = {
 BUFFER_CONFIG = {
     "capacity": 12000,
     "batch_size": 256,
+}
+
+# Noisy Binary Search Configuration
+# Parameters for the MWU-based noisy binary search hoprate adjustment.
+# Reference: Dereniowski et al. "Noisy (Binary) Searching: Simple, Fast and Correct" (STACS 2025)
+NBS_CONFIG = {
+    "p": 0.3,                 # Assumed noise probability, 0 ≤ p < 0.5.
+                               # Higher p → more exploration (needed for flat BER regions).
+    "delta": 0.01,            # Confidence threshold, 0 < δ ≤ 1.
+                               # Convergence when max weight ≥ 1 − δ.
+    "hoprate_step": 10.0,     # Discretisation step (Hz). Matches _apply_hoprate quantisation.
+    "seed": 42,               # RNG seed for reproducible query randomisation (None = random).
 }
 
 # Training Loop Configuration

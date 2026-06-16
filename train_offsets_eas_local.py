@@ -1,3 +1,10 @@
+"""
+EAS-local training entry point for FHSS anti-jamming reinforcement learning.
+
+Runs the baseline 10-offset loop with local neighborhood search, teacher-action
+replay, and distillation metrics for the SACEASLocal agent.
+"""
+
 import argparse
 import os
 import time

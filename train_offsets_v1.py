@@ -1,3 +1,11 @@
+"""
+Baseline training entry point for FHSS anti-jamming reinforcement learning.
+
+Builds the FHSSQPSKEnv environment, baseline discrete SAC agent, and replay
+buffer, then runs the autoregressive 10-offset training loop with logging and
+reward/BER/loss plots.
+"""
+
 import argparse
 import os
 import time
