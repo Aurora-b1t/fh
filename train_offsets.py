@@ -14,7 +14,7 @@ import torch
 import logging
 import matplotlib.pyplot as plt
 
-from fh_env_opt_newest import FHSSQPSKEnv
+from fh_env import FHSSQPSKEnv
 from SAC import SAC, ReplayBuffer
 import settings
 
@@ -294,8 +294,8 @@ def train(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps_per_episode", type=int, default=settings.TRAIN_CONFIG["steps_per_episode"])
-    parser.add_argument("--output_dir", type=str, default=settings.OUTPUT_DIR)
-    parser.add_argument("--log_file", type=str, default=settings.LOG_FILE)
+    parser.add_argument("--output_dir", type=str, default="outputs/offsets")
+    parser.add_argument("--log_file", type=str, default="training_log.txt")
 
     # Agent Params
     parser.add_argument("--actor_lr", type=float, default=settings.SAC_CONFIG["actor_lr"])

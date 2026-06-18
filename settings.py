@@ -1,17 +1,13 @@
 """
 Central configuration for the FHSS RL anti-jamming training project.
 
-Defines output directories, environment parameters, jammer settings, SAC and
-EAS-local hyperparameters, replay buffer sizes, noisy binary search settings,
-training loop options, and reward coefficients.
+Defines environment parameters, jammer settings, SAC and EAS-local
+hyperparameters, replay buffer sizes, noisy binary search settings, training
+loop options, and reward coefficients. Output directories are configured
+per-script via each training entry point's ``--output_dir`` argument.
 """
 
 import numpy as np
-
-# Logging and output
-# train_offsets_v1.py writes LOG_FILE and plots under OUTPUT_DIR.
-OUTPUT_DIR = "outputs/latest/0.1ms"
-LOG_FILE = "training_log.txt"
 
 # Device Configuration
 CPU_ONLY = False # Set to True to force CPU usage
@@ -69,11 +65,10 @@ JAMMER_CONFIG = {
     # SNR at the jammer is derived from ENV_CONFIG["noise_std"] and the
     # theoretical signal power (Baud / Fs), ensuring consistency with the receiver.
     "reactive": {
-        "speed": 700.0,            # (unused in new energy-detection logic; kept for compatibility)
         "power": 1.5,              # Jamming power factor
         "bandwidth": 50000.0,      # Noise bandwidth (Hz)
         "p_fa": 0.1,               # False-alarm probability for energy detection
-        "detection_time": 0.0001,   # Detection / jamming slot duration (s) — 1 ms
+        "detection_time": 0.0005,   # Detection / jamming slot duration (s) — 1 ms
     }
 }
 

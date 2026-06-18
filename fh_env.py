@@ -993,7 +993,7 @@ if __name__ == "__main__":
     obs, info = env.reset()
 
     offsets = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
-    action = {"hoprate": 500.0, "offsets": offsets}
+    action = {"hoprate": 800.0, "offsets": offsets}
     for i in range(2):
         obs, reward, terminated, truncated, info = env.step(action)
         print(f"Step {i+1}: Reward: {reward}, Mean BER: {info['mean_ber']}")
