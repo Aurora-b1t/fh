@@ -328,17 +328,17 @@ def parse_args():
                         help="Maximum target hoprate in Hz (default: 1000)")
     parser.add_argument("--hoprate_step", type=float, default=10.0,
                         help="Hoprate increment in Hz (default: 10)")
-    parser.add_argument("--steps_per_hoprate", type=int, default=2,
+    parser.add_argument("--steps_per_hoprate", type=int, default=4,
                         help="Environment steps per hoprate; each step has 10 blocks (default: 2)")
     parser.add_argument("--offset_mode", choices=["random", "zeros"], default="random",
                         help="Offset sequence mode for each env step (default: random)")
-    parser.add_argument("--seed", type=int, default=settings.NBS_CONFIG.get("seed", 42),
-                        help="Random seed for random offsets (default: settings.NBS_CONFIG['seed'])")
+    parser.add_argument("--seed", type=int, default=settings.RANDOM_SEED,
+                        help="Random seed for random offsets (default: settings.RANDOM_SEED)")
     parser.add_argument("--enable_reactive", type=str_to_bool, default=True,
                         help="Enable reactive jammer during sweep (default: true)")
     parser.add_argument("--enable_sweep", type=str_to_bool, default=False,
                         help="Enable sweep/comb jammer during sweep (default: false)")
-    parser.add_argument("--output_dir", type=str, default="outputs/speed_sweep",
+    parser.add_argument("--output_dir", type=str, default="outputs/speed_sweep/0.5ms",
                         help="Directory for logs, CSV, NPZ, and plots")
     parser.add_argument("--no_plots", action="store_true",
                         help="Do not save PNG plots; CSV and NPZ outputs are still saved.")
@@ -348,4 +348,6 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    sweep(parse_args())
+    args = parse_args()
+    settings.set_random_seeds(args.seed)
+    sweep(args)

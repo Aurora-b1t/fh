@@ -90,7 +90,6 @@ def search(args):
                 f"sweep={env_config['enable_sweep']}")
 
     # ---- derivative-based noisy binary search ----------------------------------
-    nbs_seed = settings.NBS_CONFIG.get("seed", None)
     nbs = DerivativeNoisyBinarySearch(
         hoprate_min=env.hoprate_min,
         hoprate_max=env.hoprate_max,
@@ -98,7 +97,6 @@ def search(args):
         p=args.nbs_p,
         delta=args.nbs_delta,
         derivative_threshold=args.derivative_threshold,
-        seed=nbs_seed,
     )
     logger.info(f"NBS: p={nbs.p}, δ={nbs.delta}, "
                 f"step={nbs.hoprate_step} Hz, "
@@ -286,9 +284,9 @@ def parse_args():
     )
 
     # ---- main loop ------------------------------------------------------------
-    p.add_argument("--steps", type=int, default=300,
-                   help="Number of environment steps (default: 300)")
-    p.add_argument("--output_dir", type=str, default="outputs/speed_derivative")
+    p.add_argument("--steps", type=int, default=400,
+                   help="Number of environment steps (default: 400)")
+    p.add_argument("--output_dir", type=str, default="outputs/speed_derivative/0.5ms/-0.005")
     p.add_argument("--log_file", type=str, default="training_log.txt")
 
     # ---- environment overrides ------------------------------------------------
@@ -309,4 +307,5 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    settings.set_random_seeds()
     search(parse_args())

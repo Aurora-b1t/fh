@@ -73,14 +73,12 @@ def search(args):
                 f"sweep={env_config['enable_sweep']}")
 
     # ---- noisy binary search ---------------------------------------------------
-    nbs_seed = settings.NBS_CONFIG.get("seed", None)
     nbs = NoisyBinarySearch(
         hoprate_min=env.hoprate_min,
         hoprate_max=env.hoprate_max,
         hoprate_step=args.nbs_step,
         p=args.nbs_p,
         delta=args.nbs_delta,
-        seed=nbs_seed,
     )
     logger.info(f"NBS: p={nbs.p}, δ={nbs.delta}, "
                 f"step={nbs.hoprate_step} Hz, "
@@ -264,4 +262,5 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    settings.set_random_seeds()
     search(parse_args())

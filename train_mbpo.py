@@ -1,0 +1,319 @@
+"""
+MBPO reward-model training entry point for FHSS anti-jamming SAC.
+
+SAC remains the policy/critic learner.  The MBPO ensemble predicts one-step
+rewards only, then generates rollout=1 synthetic replay entries for SAC updates.
+"""
+
+import argparse
+import logging
+import os
+import time
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+from SAC import ReplayBuffer
+from r_predict_model import EnsembleDynamicsModel
+from r_predict_model.mbpo_adapter import (
+    concat_transition_batches,
+    rollout_reward_model,
+    train_reward_model_from_replay,
+)
+import settings
+from train_offsets import build_agent_and_env, compute_block_rewards, setup_logger
+
+
+def sample_mixed_batch(real_buffer, model_buffer, batch_size, real_ratio):
+    real_ratio = float(np.clip(real_ratio, 0.0, 1.0))
+    batches = []
+    if model_buffer.size() > 0:
+        real_batch_size = min(int(batch_size * real_ratio), real_buffer.size())
+        model_batch_size = min(batch_size - real_batch_size, model_buffer.size())
+        if real_batch_size > 0:
+            batches.append(real_buffer.sample(real_batch_size))
+        if model_batch_size > 0:
+            batches.append(model_buffer.sample(model_batch_size))
+    else:
+        real_batch_size = min(batch_size, real_buffer.size())
+        if real_batch_size > 0:
+            batches.append(real_buffer.sample(real_batch_size))
+
+    return concat_transition_batches(batches)
+
+
+def store_real_transitions(
+    buffer,
+    state_img,
+    next_state_img,
+    fixed_hoprate,
+    offsets,
+    per_block_rewards,
+):
+    arr_before = np.zeros(10, dtype=np.float32)
+    for i in range(10):
+        action = int(offsets[i])
+        arr_after = arr_before.copy()
+        arr_after[i] = action
+        buffer.add(
+            state_img,
+            fixed_hoprate,
+            arr_before,
+            action,
+            float(per_block_rewards[i]),
+            next_state_img,
+            fixed_hoprate,
+            arr_after,
+            False,
+        )
+        arr_before[i] = action
+
+
+def train(args):
+    os.makedirs(args.output_dir, exist_ok=True)
+    log_path = os.path.join(args.output_dir, args.log_file)
+    logger = setup_logger(log_path)
+    logger.info(f"Output directory: {args.output_dir}")
+    logger.info(f"Log file: {log_path}")
+
+    env, agent, real_buffer, device, n_actions = build_agent_and_env(args)
+    model_buffer = ReplayBuffer(capacity=args.model_replay_size)
+    fixed_hoprate = settings.TRAIN_CONFIG["fixed_hoprate"]
+
+    state_img, _info = env.reset()
+    reward_model = EnsembleDynamicsModel(
+        network_size=args.num_networks,
+        elite_size=args.num_elites,
+        state_size=int(np.asarray(state_img).size + 1 + 10),
+        action_size=1,
+        reward_size=1,
+        hidden_size=args.pred_hidden_size,
+        use_decay=True,
+        device=device,
+    )
+
+    logger.info(
+        "MBPO reward model: networks=%d elites=%d hidden=%d rollout_length=1 "
+        "real_ratio=%.2f",
+        args.num_networks,
+        args.num_elites,
+        args.pred_hidden_size,
+        args.real_ratio,
+    )
+    logger.info(f"Start MBPO+SAC training for {args.steps_per_episode} environment steps.")
+
+    start_time = time.time()
+    ep_block_rewards = []
+    plot_rewards = []
+    plot_bers = []
+    plot_losses_actor = []
+    plot_losses_critic = []
+    plot_model_rewards = []
+    last_model_stats = {}
+    last_rollout_stats = {}
+
+    for step_idx in range(1, args.steps_per_episode + 1):
+        step_start = time.time()
+
+        offsets = np.zeros(10, dtype=np.float32)
+        action_arr_before = np.zeros(10, dtype=np.float32)
+        for i in range(10):
+            action = agent.take_action(state_img, fixed_hoprate, action_arr_before)
+            action = int(np.clip(action, 0, n_actions - 1))
+            offsets[i] = action
+            action_arr_before[i] = action
+
+        next_state_img, _reward_total, terminated, truncated, info = env.step(
+            {"hoprate": fixed_hoprate, "offsets": offsets}
+        )
+
+        ber_blocks = info.get("ber_blocks", [])
+        per_block_rewards = compute_block_rewards(
+            ber_blocks,
+            info.get("hoprate_used", fixed_hoprate),
+        )
+        store_real_transitions(
+            real_buffer,
+            state_img,
+            next_state_img,
+            fixed_hoprate,
+            offsets,
+            per_block_rewards,
+        )
+
+        ep_block_rewards.extend(per_block_rewards)
+        mean_step_ber = float(np.mean(ber_blocks)) if len(ber_blocks) > 0 else 0.0
+        mean_step_reward = float(np.mean(per_block_rewards)) if len(per_block_rewards) > 0 else 0.0
+        state_img = next_state_img
+
+        if (
+            real_buffer.size() >= args.min_buffer_before_train
+            and step_idx % args.model_train_freq == 0
+        ):
+            last_model_stats = train_reward_model_from_replay(
+                reward_model,
+                real_buffer,
+                args.model_train_batch_size,
+            )
+            last_rollout_stats = rollout_reward_model(
+                reward_model,
+                agent,
+                real_buffer,
+                model_buffer,
+                args.rollout_batch_size,
+                fixed_hoprate,
+                n_actions,
+            )
+            logger.info(
+                "Reward model | holdout_loss=%.6f | elites=%s | epochs=%d | "
+                "model_rollout=%d | model_rew=%.4f+/-%.4f",
+                last_model_stats.get("holdout_loss_mean", 0.0),
+                last_model_stats.get("elite_model_idxes", []),
+                last_model_stats.get("epochs", 0),
+                last_rollout_stats.get("generated", 0),
+                last_rollout_stats.get("reward_mean", 0.0),
+                last_rollout_stats.get("reward_std", 0.0),
+            )
+
+        train_stats = {}
+        if real_buffer.size() >= args.min_buffer_before_train:
+            for _ in range(args.update_iters_per_step):
+                batch = sample_mixed_batch(
+                    real_buffer,
+                    model_buffer,
+                    args.batch_size,
+                    args.real_ratio,
+                )
+                train_stats = agent.update(batch)
+
+        step_duration = time.time() - step_start
+        plot_rewards.append(mean_step_reward)
+        plot_bers.append(mean_step_ber)
+        plot_losses_actor.append(train_stats.get("actor_loss", 0.0) if train_stats else 0.0)
+        plot_losses_critic.append(train_stats.get("critic1_loss", 0.0) if train_stats else 0.0)
+        plot_model_rewards.append(last_rollout_stats.get("reward_mean", 0.0))
+
+        log_msg = (
+            f"Step {step_idx}/{args.steps_per_episode} | "
+            f"Offsets: {offsets.astype(int).tolist()} | "
+            f"Rew: {mean_step_reward:.4f} | BER: {mean_step_ber:.4f} | "
+            f"RealBuf={real_buffer.size()} | ModelBuf={model_buffer.size()}"
+        )
+        if last_model_stats:
+            log_msg += (
+                f" | ModelHoldout={last_model_stats.get('holdout_loss_mean', 0.0):.6f} "
+                f"| Elites={last_model_stats.get('elite_model_idxes', [])}"
+            )
+        if train_stats:
+            log_msg += (
+                f" | Loss: A={train_stats.get('actor_loss', 0.0):.3f}, "
+                f"C={train_stats.get('critic1_loss', 0.0):.3f}, "
+                f"Alpha={train_stats.get('alpha', 0.0):.5f}"
+            )
+        log_msg += f" | T: {step_duration:.2f}s"
+        logger.info(log_msg)
+
+        if terminated or truncated:
+            logger.info("Episode terminated early.")
+            break
+
+    save_plots(
+        args.output_dir,
+        plot_rewards,
+        plot_bers,
+        plot_losses_actor,
+        plot_losses_critic,
+        plot_model_rewards,
+        logger,
+    )
+    total_duration = time.time() - start_time
+    mean_ep_reward = float(np.mean(ep_block_rewards)) if ep_block_rewards else 0.0
+    logger.info(f"Total Time: {total_duration:.2f}s | Mean Ep Reward: {mean_ep_reward:.4f}")
+
+
+def save_plots(
+    output_dir,
+    plot_rewards,
+    plot_bers,
+    plot_losses_actor,
+    plot_losses_critic,
+    plot_model_rewards,
+    logger,
+):
+    try:
+        plt.figure()
+        plt.plot(plot_rewards)
+        plt.title("Mean Step Reward")
+        plt.xlabel("Step")
+        plt.ylabel("Reward")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "reward.png"))
+        plt.close()
+
+        plt.figure()
+        plt.plot(plot_bers, color="r")
+        plt.title("Mean Step BER")
+        plt.xlabel("Step")
+        plt.ylabel("BER")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "ber.png"))
+        plt.close()
+
+        plt.figure()
+        plt.plot(plot_losses_actor, label="Actor Loss", alpha=0.7)
+        plt.plot(plot_losses_critic, label="Critic Loss", alpha=0.7)
+        plt.title("Training Loss")
+        plt.xlabel("Step")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "loss.png"))
+        plt.close()
+
+        plt.figure()
+        plt.plot(plot_model_rewards)
+        plt.title("Synthetic Reward Mean")
+        plt.xlabel("Step")
+        plt.ylabel("Reward")
+        plt.grid(True)
+        plt.savefig(os.path.join(output_dir, "model_reward.png"))
+        plt.close()
+        logger.info(f"Plots saved to {output_dir}.")
+    except Exception as exc:
+        logger.error(f"Plotting failed: {exc}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="SAC + MBPO reward-model training")
+    parser.add_argument("--steps_per_episode", type=int, default=settings.TRAIN_CONFIG["steps_per_episode"])
+    parser.add_argument("--output_dir", type=str, default="outputs/mbpo")
+    parser.add_argument("--log_file", type=str, default="training_log.txt")
+
+    parser.add_argument("--actor_lr", type=float, default=settings.SAC_CONFIG["actor_lr"])
+    parser.add_argument("--critic_lr", type=float, default=settings.SAC_CONFIG["critic_lr"])
+    parser.add_argument("--alpha_lr", type=float, default=settings.SAC_CONFIG["alpha_lr"])
+    parser.add_argument("--tau", type=float, default=settings.SAC_CONFIG["tau"])
+    parser.add_argument("--gamma", type=float, default=settings.SAC_CONFIG["gamma"])
+
+    parser.add_argument("--replay_size", type=int, default=settings.BUFFER_CONFIG["capacity"])
+    parser.add_argument("--batch_size", type=int, default=settings.BUFFER_CONFIG["batch_size"])
+    parser.add_argument("--min_buffer_before_train", type=int, default=settings.TRAIN_CONFIG["min_buffer_before_train"])
+    parser.add_argument("--update_iters_per_step", type=int, default=settings.TRAIN_CONFIG["update_iters_per_step"])
+
+    parser.add_argument("--real_ratio", type=float, default=settings.MBPO_CONFIG["real_ratio"])
+    parser.add_argument("--model_train_freq", type=int, default=settings.MBPO_CONFIG["model_train_freq"])
+    parser.add_argument("--rollout_batch_size", type=int, default=settings.MBPO_CONFIG["rollout_batch_size"])
+    parser.add_argument("--model_replay_size", type=int, default=settings.MBPO_CONFIG["model_replay_size"])
+    parser.add_argument("--num_networks", type=int, default=settings.MBPO_CONFIG["num_networks"])
+    parser.add_argument("--num_elites", type=int, default=settings.MBPO_CONFIG["num_elites"])
+    parser.add_argument("--pred_hidden_size", type=int, default=settings.MBPO_CONFIG["hidden_size"])
+    parser.add_argument("--model_train_batch_size", type=int, default=settings.MBPO_CONFIG["model_train_batch_size"])
+
+    parser.add_argument("--cpu_only", action="store_true", default=settings.CPU_ONLY)
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    settings.set_random_seeds()
+    torch.set_num_threads(max(1, torch.get_num_threads()))
+    train(parse_args())

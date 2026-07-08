@@ -46,6 +46,8 @@ Convergence is declared when max(weights) ≥ 1 − δ.
 import numpy as np
 from typing import Tuple, Optional
 
+import settings
+
 
 class NoisyBinarySearch:
     """
@@ -323,7 +325,7 @@ if __name__ == "__main__":
         nbs = NoisyBinarySearch(
             hoprate_min=10.0, hoprate_max=1000.0, hoprate_step=10.0,
             p=0.1, delta=0.05,
-            seed=42,
+            seed=settings.RANDOM_SEED,
         )
         print(f"\n{'='*60}")
         print(f"Mode: {label}")

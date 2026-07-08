@@ -315,5 +315,6 @@ def parse_args():
 
 
 if __name__ == "__main__":
+    settings.set_random_seeds()
     args = parse_args()
     train(args)

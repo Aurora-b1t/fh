@@ -8,17 +8,24 @@ and hoprate, instead of simple BER increase/decrease, to make directional decisi
 
 Core idea: instead of using a binary "BER went up/down" signal, we calculate:
 
-    metric = ΔBER_percent / Δhoprate_clamped
+    metric = ΔBER_percent / Δhoprate
 
-Where:
-  - ΔBER_percent = (current_BER - previous_BER) × 100
+Where the deltas are taken between the *current* observation and the most recent
+*prior* observation whose hoprate was **different** from the current one:
+
+  - ΔBER_percent = (current_BER - reference_BER) × 100
     (BER change in percentage points, e.g., 0.1 → 0.02 gives ΔBER_percent = -8)
-  - Δhoprate_clamped = current_hoprate - previous_hoprate
-    If Δhoprate is exactly 0, it is clamped to -0.01 to avoid division by zero.
+  - Δhoprate = current_hoprate - reference_hoprate
 
-And use this continuous metric to decide which half of the search space to
-reinforce.  This uses more information from each observation than the original
-binary comparison.
+Comparing against the immediately previous step is meaningless when the hoprate
+has not changed (Δhoprate = 0).  Instead we keep a small history and always
+compute the gradient against the last observation taken at a *different* hoprate.
+For example, given (500 Hz, 0.20), (520 Hz, 0.15), (520 Hz, 0.16), the third step
+uses the first step as its reference: ΔBER% = (0.16 − 0.20)×100, Δhoprate = 20.
+
+History is pruned to at most two records — the latest observation and the most
+recent different-hoprate observation — because once a different-hoprate reference
+exists, any earlier (and even earlier same-hoprate) records are unnecessary.
 
 Decision rule (configurable threshold, default -0.002):
 
@@ -30,8 +37,8 @@ Decision rule (configurable threshold, default -0.002):
                           → h ≥ h_curr compatible  →  w × 2(1−p)
                           → h < h_curr incompatible →  w × 2p
 
-Special case: if Δhoprate is exactly 0, it is clamped to -0.01 to avoid division
-by zero and provide a deterministic default direction.
+Because the reference always has a different hoprate than the current
+observation, Δhoprate is never 0 and no division-by-zero fallback is needed.
 
 The rest of the algorithm (weight normalisation, weighted-median query
 selection, convergence criterion) is identical to the original implementation.
@@ -40,13 +47,17 @@ selection, convergence criterion) is identical to the original implementation.
 import numpy as np
 from typing import Tuple, Optional
 
+import settings
+
 
 class DerivativeNoisyBinarySearch:
     """
     Derivative-based noisy binary search over a hoprate range [hoprate_min, hoprate_max].
 
     Uses Δhoprate / ΔBER derivative instead of simple BER comparison to make
-    directional decisions.
+    directional decisions.  The derivative is always computed against the most
+    recent prior observation taken at a *different* hoprate (not necessarily the
+    immediately previous step).
 
     Parameters
     ----------
@@ -101,11 +112,21 @@ class DerivativeNoisyBinarySearch:
         # ---- internal state ---------------------------------------------------
         self.weights = np.ones(self.n_candidates, dtype=np.float64) / self.n_candidates
 
+        # The query selected for the next environment step (the hoprate that will
+        # be, or just was, tested).  Set by ``_select_hoprate``.
         self._current_idx: Optional[int] = None
-        self._previous_idx: Optional[int] = None
         self._current_hoprate: Optional[float] = None
-        self._previous_hoprate: Optional[float] = None
-        self._previous_ber: Optional[float] = None
+
+        # Latest completed observation (hoprate actually tested + its BER).
+        self._obs_hoprate: Optional[float] = None
+        self._obs_ber: Optional[float] = None
+
+        # Most recent completed observation whose hoprate differs from
+        # ``_obs_hoprate`` — the reference against which the gradient is taken.
+        # Its hoprate is guaranteed != ``_obs_hoprate`` whenever it is not None.
+        self._ref_hoprate: Optional[float] = None
+        self._ref_ber: Optional[float] = None
+
         self._step_count: int = 0
 
         self._rng = np.random.RandomState(seed)
@@ -130,10 +151,11 @@ class DerivativeNoisyBinarySearch:
         """
         self.weights = np.ones(self.n_candidates, dtype=np.float64) / self.n_candidates
         self._current_idx = None
-        self._previous_idx = None
         self._current_hoprate = None
-        self._previous_hoprate = None
-        self._previous_ber = None
+        self._obs_hoprate = None
+        self._obs_ber = None
+        self._ref_hoprate = None
+        self._ref_ber = None
         self._step_count = 0
         self._last_derivative = None
         self._last_delta_hoprate = None
@@ -142,11 +164,12 @@ class DerivativeNoisyBinarySearch:
 
     def seed_observation(self, hoprate: float, ber: float) -> None:
         """
-        Seed the algorithm with an initial (hoprate, BER) pair.
+        Seed the algorithm with an initial (hoprate, BER) observation.
 
         Use this when the first tested hoprate is chosen externally (not via
-        ``reset()``).  After calling, the next ``step()`` will compare its BER
-        against this seed and update weights accordingly.
+        ``reset()``).  The seeded pair is recorded as the latest observation; if
+        a previous observation exists at a different hoprate it is kept as the
+        reference, so the next ``step()`` can immediately compute a gradient.
 
         Parameters
         ----------
@@ -156,19 +179,34 @@ class DerivativeNoisyBinarySearch:
             The mean BER observed at that hoprate.
         """
         idx = int(np.argmin(np.abs(self.candidates - float(hoprate))))
-        self._previous_idx = self._current_idx
-        self._previous_hoprate = self._current_hoprate
+        h_new = float(self.candidates[idx])
+        ber = float(ber)
+
+        if self._obs_ber is not None and h_new != self._obs_hoprate:
+            # Promote the previous latest observation to the reference.
+            self._ref_hoprate = self._obs_hoprate
+            self._ref_ber = self._obs_ber
+        # If h_new == _obs_hoprate, keep the existing reference and just refresh
+        # the latest BER below.
+
         self._current_idx = idx
-        self._current_hoprate = float(self.candidates[idx])
-        self._previous_ber = float(ber)
+        self._current_hoprate = h_new
+        self._obs_hoprate = h_new
+        self._obs_ber = ber
 
     def step(self, ber: float) -> float:
         """
         Update weights using the observed BER and return the next hoprate.
 
-        The BER is compared against the *previous* step's BER via the derivative
-        metric.  On the very first call (no previous BER exists) the weights stay
-        uniform and only a new hoprate is selected.
+        The BER is compared against the most recent *prior observation at a
+        different hoprate* (the reference) via the derivative metric.  If the
+        hoprate just tested matches the latest stored observation, only that
+        observation's BER is refreshed (the reference is reused).  If the hoprate
+        changed, the previous latest observation becomes the new reference.
+
+        On the very first call (no prior observation exists) the weights stay
+        uniform and only a new hoprate is selected.  No update is performed until
+        two observations at *different* hoprates have been seen.
 
         Parameters
         ----------
@@ -181,18 +219,43 @@ class DerivativeNoisyBinarySearch:
             The hoprate to use for the next environment step.
         """
         self._step_count += 1
+        ber = float(ber)
 
-        # Guard: first call has no prior BER to compare
-        if self._previous_ber is None:
-            self._previous_ber = float(ber)
+        # Hoprate that was just tested (selected at the end of the previous step).
+        h_new = self._current_hoprate
+
+        # First observation: record it, no reference to compare against yet.
+        if self._obs_ber is None:
+            self._obs_hoprate = h_new
+            self._obs_ber = ber
             return self._select_hoprate()
 
-        # Already saved prev BER / idx; now update weights
-        ber_prev = self._previous_ber
-        self._previous_ber = float(ber)
+        if h_new == self._obs_hoprate:
+            # Same hoprate as the latest observation: refresh its BER to the
+            # latest reading (older readings at this hoprate are discarded).
+            # The reference (different hoprate) is reused as-is.
+            self._obs_ber = ber
+        else:
+            # Hoprate changed: the previous latest observation becomes the new
+            # reference (its hoprate differs from h_new).  The old reference is
+            # no longer needed and is discarded.
+            self._ref_hoprate = self._obs_hoprate
+            self._ref_ber = self._obs_ber
+            self._obs_hoprate = h_new
+            self._obs_ber = ber
 
-        self._update_weights(float(ber), ber_prev)
+        # Update weights whenever a different-hoprate reference is available.
+        if (self._ref_ber is not None and self._ref_hoprate is not None
+                and self._ref_hoprate != h_new):
+            self._update_weights(ber, self._ref_ber, h_new, self._ref_hoprate)
+        else:
+            # No different-hoprate reference yet (only one hoprate seen so far):
+            # a real gradient cannot be formed.  Force a move so the weighted
+            # median shifts and a different hoprate gets sampled next — this is
+            # the same bootstrap the original algorithm used for Δhoprate == 0.
+            self._force_move()
         self._normalize()
+
         return self._select_hoprate()
 
     def get_best_hoprate(self) -> float:
@@ -262,8 +325,6 @@ class DerivativeNoisyBinarySearch:
         else:
             chosen = k
 
-        self._previous_idx = self._current_idx
-        self._previous_hoprate = self._current_hoprate
         self._current_idx = int(chosen)
         self._current_hoprate = float(self.candidates[chosen])
         return self._current_hoprate
@@ -272,47 +333,66 @@ class DerivativeNoisyBinarySearch:
     # Internal: MWU weight update — DERIVATIVE VERSION
     # ------------------------------------------------------------------
 
-    def _update_weights(self, ber: float, ber_prev: float) -> None:
+    def _update_weights(self, ber_curr: float, ber_ref: float,
+                        h_curr: float, h_ref: float) -> None:
         """
         Apply the MWU weight update using the derivative metric.
 
-        The current hoprate *h_curr* is the query element.  The directional
-        answer is derived from the metric (ΔBER_percent / Δhoprate_clamped):
+        The gradient is taken between the current observation (``h_curr``,
+        ``ber_curr``) and the most recent prior observation at a *different*
+        hoprate (``h_ref``, ``ber_ref``).  The current hoprate *h_curr* is the
+        query element (split point).  The directional answer is derived from:
 
-            delta_ber_percent = (ber_curr - ber_prev) * 100
-            delta_hoprate_clamped = h_curr - h_prev if (h_curr - h_prev) != 0 else -0.01
-            metric = delta_ber_percent / delta_hoprate_clamped
+            delta_ber_percent = (ber_curr - ber_ref) * 100
+            delta_hoprate     = h_curr - h_ref          (guaranteed != 0)
+            metric            = delta_ber_percent / delta_hoprate
 
             metric > threshold   →  answer = LEFT   →  h ≤ h_curr compatible
             metric ≤ threshold   →  answer = RIGHT  →  h ≥ h_curr compatible
 
-        If Δhoprate is exactly 0, it is clamped to -0.01 to avoid division by zero.
+        Because ``h_ref`` is always a different hoprate than ``h_curr``,
+        ``delta_hoprate`` is never zero and no clamp is required.
 
         Compatible weights are multiplied by 2(1−p), incompatible by 2p.
         The split point is always the current hoprate index.
         """
-        if (self._previous_idx is None or
-            self._current_idx is None or
-            self._previous_hoprate is None or
-            self._current_hoprate is None):
+        curr_idx = self._current_idx
+        if curr_idx is None:
             return
 
-        curr_idx = self._current_idx
-
-        # Calculate delta hoprate, handle zero case
-        delta_hoprate = self._current_hoprate - self._previous_hoprate
+        # Δhoprate is guaranteed non-zero: the reference hoprate always differs
+        # from the current hoprate (enforced by ``step`` / ``seed_observation``).
+        delta_hoprate = h_curr - h_ref
+        delta_ber = ber_curr - ber_ref
         self._last_delta_hoprate = delta_hoprate
-        delta_hoprate_clamped = delta_hoprate if delta_hoprate != 0 else -0.01
-
-        # Calculate delta BER in percentage points (remove % sign)
-        delta_ber = ber - ber_prev
         self._last_delta_ber = delta_ber
-        delta_ber_percent = delta_ber * 100
 
-        # Calculate metric
-        metric = delta_ber_percent / delta_hoprate_clamped
+        metric = (delta_ber * 100) / delta_hoprate
         self._last_derivative = metric
 
+        self._apply_metric(metric, curr_idx)
+
+    def _force_move(self) -> None:
+        """
+        Bootstrap fallback used before any different-hoprate reference exists.
+
+        With only one hoprate observed so far, no real gradient can be formed.
+        Force a RIGHT move (metric just below the threshold) so the weighted
+        median shifts and a different hoprate is sampled on the next step —
+        matching the original algorithm's behaviour for the Δhoprate == 0 case.
+        """
+        curr_idx = self._current_idx
+        if curr_idx is None:
+            return
+
+        self._last_delta_hoprate = 0.0
+        self._last_delta_ber = 0.0
+        self._last_derivative = self.derivative_threshold - 0.001  # ≤ threshold → RIGHT
+
+        self._apply_metric(self._last_derivative, curr_idx)
+
+    def _apply_metric(self, metric: float, curr_idx: int) -> None:
+        """Apply the MWU weight update for a given metric and split point."""
         indices = np.arange(self.n_candidates)
 
         # Decision based on threshold
@@ -359,7 +439,7 @@ if __name__ == "__main__":
             hoprate_min=10.0, hoprate_max=1000.0, hoprate_step=10.0,
             p=0.1, delta=0.05,
             derivative_threshold=threshold,
-            seed=42,
+            seed=settings.RANDOM_SEED,
         )
         print(f"\n{'='*60}")
         print(f"Mode: {label}")

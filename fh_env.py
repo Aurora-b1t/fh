@@ -981,10 +981,10 @@ class FHSSQPSKEnv(gym.Env):
 if __name__ == "__main__":
     pr_start = time.time()
     # Note: Jammer configuration is now loaded from settings.py
-    env = FHSSQPSKEnv(enable_reactive=True,
+    env = FHSSQPSKEnv(enable_reactive=False,
                       enable_sweep=False,
                       enable_rayleigh=True,
-                      debug_plot_psd=True,
+                      debug_plot_psd=False,
                       debug_log_hops=False,
                       use_pregen=True,
                       pregen_steps=44) # Match the 4.4s cycle (44 * 0.1s)
@@ -993,7 +993,7 @@ if __name__ == "__main__":
     obs, info = env.reset()
 
     offsets = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.float32)
-    action = {"hoprate": 800.0, "offsets": offsets}
-    for i in range(2):
+    action = {"hoprate": 200.0, "offsets": offsets}
+    for i in range(10):
         obs, reward, terminated, truncated, info = env.step(action)
         print(f"Step {i+1}: Reward: {reward}, Mean BER: {info['mean_ber']}")

@@ -7,10 +7,43 @@ loop options, and reward coefficients. Output directories are configured
 per-script via each training entry point's ``--output_dir`` argument.
 """
 
+import random
 import numpy as np
 
 # Device Configuration
 CPU_ONLY = False # Set to True to force CPU usage
+
+# Global Random Seed for full reproducibility
+RANDOM_SEED = 42
+
+
+def set_random_seeds(seed=None):
+    """
+    Set random seeds for all random number generators to ensure reproducibility.
+
+    Args:
+        seed: Random seed. If None, uses settings.RANDOM_SEED.
+    """
+    if seed is None:
+        seed = RANDOM_SEED
+
+    # Python standard library
+    random.seed(seed)
+
+    # NumPy
+    np.random.seed(seed)
+
+    # PyTorch (import locally to avoid circular dependency)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        # Ensure CUDA convolution determinism
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
 
 # Environment Configuration
 # Passed to FHSSQPSKEnv(**ENV_CONFIG)
@@ -82,23 +115,23 @@ SAC_CONFIG = {
     "target_entropy_ratio": 0.1,
 }
 
-# EAS-style local neighborhood search SAC variant
-EAS_LOCAL_CONFIG = {
-    "search_radius": 2,
-    "distill_coef": 0.5,
-    "search_eval": "min_q",
-    "teacher_from_replay": True,
-    "log_search_stats": True,
-    "eas_replay_capacity": 6000,
-    "eas_batch_size": 256,
-    "filter_teacher_on_update": True,
-    "teacher_compare_mode": "min_q",
-}
-
 # Replay Buffer Configuration
 BUFFER_CONFIG = {
     "capacity": 12000,
     "batch_size": 256,
+}
+
+# MBPO Reward-Model Configuration
+MBPO_CONFIG = {
+    "num_networks": 5,
+    "num_elites": 3,
+    "hidden_size": 200,
+    "model_train_freq": 50,
+    "model_train_batch_size": 256,
+    "rollout_batch_size": 1024,
+    "rollout_length": 1,
+    "real_ratio": 0.5,
+    "model_replay_size": 12000,
 }
 
 # Noisy Binary Search Configuration
@@ -110,7 +143,6 @@ NBS_CONFIG = {
     "delta": 0.01,            # Confidence threshold, 0 < δ ≤ 1.
                                # Convergence when max weight ≥ 1 − δ.
     "hoprate_step": 10.0,     # Discretisation step (Hz). Matches _apply_hoprate quantisation.
-    "seed": 42,               # RNG seed for reproducible query randomisation (None = random).
 }
 
 # Training Loop Configuration
