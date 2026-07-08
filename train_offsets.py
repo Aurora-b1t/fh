@@ -132,20 +132,15 @@ def train(args):
         step_start_time = time.time()
         
         # -------------------------------------------------------
-        # 1. Decision Making (Autoregressive for 10 offsets)
+        # 1. Decision Making for 10 block offsets
         # -------------------------------------------------------
         offsets = np.zeros(10, dtype=np.float32)
-        action_arr_before = np.zeros(10, dtype=np.float32)
 
         for i in range(10):
-            # Take action using current state and history
-            a_i = agent.take_action(state_img, fixed_hoprate, action_arr_before)
+            # Take action using current state and block position.
+            a_i = agent.take_action(state_img, fixed_hoprate, i)
             a_i = int(np.clip(a_i, 0, n_actions - 1))
-            
             offsets[i] = a_i
-            
-            if i < 10:
-                action_arr_before[i] = a_i
 
         # -------------------------------------------------------
         # 2. Environment Step
@@ -168,30 +163,22 @@ def train(args):
         mean_step_reward = np.mean(per_block_rewards) if len(per_block_rewards) > 0 else 0.0
 
         # Store transitions in Replay Buffer (10 per step)
-        arr_before = np.zeros(10, dtype=np.float32)
-        
         for i in range(10):
             a_i = int(offsets[i])
             r_i = float(per_block_rewards[i])
-
-            arr_after = arr_before.copy()
-            if i < 10:
-                arr_after[i] = a_i
+            next_block_idx = min(i + 1, 9)
 
             buffer.add(
                 state_img,         # s_t
                 fixed_hoprate,     # hop_rate
-                arr_before,        # action_history_t
+                i,                 # block_idx
                 a_i,               # a_t
                 r_i,               # r_t
                 next_state_img,    # s_{t+1}
                 fixed_hoprate,     # hop_rate (same)
-                arr_after,         # action_history_{t+1}
+                next_block_idx,    # next block_idx
                 False,             # done
             )
-
-            if i < 10:
-                arr_before[i] = a_i
 
         # Move to next state
         state_img = next_state_img

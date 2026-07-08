@@ -258,13 +258,13 @@ reward = base_reward - ber_penalty * BER - hoprate_penalty * hoprate
 当前 offset 训练流程如下：
 
 1. 环境 `reset()` 返回 100 ms PSD waterfall observation。
-2. 训练脚本固定 hoprate，从全零 action history 开始。
-3. SAC actor 按顺序生成 10 个 offset；第 `i` 个 offset 的输入包含当前 observation、固定 hoprate 和已经生成的 action history。
+2. 训练脚本固定 hoprate。
+3. SAC actor 按顺序生成 10 个 offset；第 `i` 个 offset 的输入包含当前 observation、固定 hoprate 和 block index `i`。
 4. 环境一次性执行这 10 个 offset，对应 10 个 100 ms block。
 5. 环境返回下一个 observation，以及 `info["ber_blocks"]`。
 6. 训练脚本把 10 个 block 拆成 10 条 replay transitions。
 
-这是一种工程近似：每个子动作共享同一个环境前态和最终后态，通过 10 维 action history 区分 offset 的顺序。它便于复用当前离散 SAC 结构，但不是严格的 sequence-level MDP 建模。如果后续要更严格处理 10 个 offset 的时序决策，可以考虑 LSTM、Transformer encoder、sequence-level SAC/PPO 或显式 sequence policy。
+这是一种工程近似：每个子动作共享同一个环境前态和最终后态，通过 block index 区分 offset 的顺序。它便于复用当前离散 SAC 结构，但不是严格的 sequence-level MDP 建模。如果后续要更严格处理 10 个 offset 的时序决策，可以考虑 LSTM、Transformer encoder、sequence-level SAC/PPO 或显式 sequence policy。
 
 ## 通信环境设计取舍
 

@@ -51,23 +51,20 @@ def store_real_transitions(
     offsets,
     per_block_rewards,
 ):
-    arr_before = np.zeros(10, dtype=np.float32)
     for i in range(10):
         action = int(offsets[i])
-        arr_after = arr_before.copy()
-        arr_after[i] = action
+        next_block_idx = min(i + 1, 9)
         buffer.add(
             state_img,
             fixed_hoprate,
-            arr_before,
+            i,
             action,
             float(per_block_rewards[i]),
             next_state_img,
             fixed_hoprate,
-            arr_after,
+            next_block_idx,
             False,
         )
-        arr_before[i] = action
 
 
 def train(args):
@@ -85,7 +82,7 @@ def train(args):
     reward_model = EnsembleDynamicsModel(
         network_size=args.num_networks,
         elite_size=args.num_elites,
-        state_size=int(np.asarray(state_img).size + 1 + 10),
+        state_size=int(np.asarray(state_img).size + 1 + 1),
         action_size=1,
         reward_size=1,
         hidden_size=args.pred_hidden_size,
@@ -117,12 +114,10 @@ def train(args):
         step_start = time.time()
 
         offsets = np.zeros(10, dtype=np.float32)
-        action_arr_before = np.zeros(10, dtype=np.float32)
         for i in range(10):
-            action = agent.take_action(state_img, fixed_hoprate, action_arr_before)
+            action = agent.take_action(state_img, fixed_hoprate, i)
             action = int(np.clip(action, 0, n_actions - 1))
             offsets[i] = action
-            action_arr_before[i] = action
 
         next_state_img, _reward_total, terminated, truncated, info = env.step(
             {"hoprate": fixed_hoprate, "offsets": offsets}

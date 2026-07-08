@@ -2,11 +2,11 @@
 Reward-only ensemble model used by the MBPO training entry point.
 
 The original MBPO template predicted reward plus state deltas for continuous
-control.  In this project the SAC state is a PSD image plus autoregressive
-offset history, and synthetic rollouts are intentionally limited to one step.
+control.  In this project the SAC state is a PSD image plus the current block
+index, and synthetic rollouts are intentionally limited to one step.
 The model therefore learns only:
 
-    flattened(state_img, hoprate, action_arr, action) -> reward
+    flattened(state_img, hoprate, block_idx, action) -> reward
 """
 
 import itertools

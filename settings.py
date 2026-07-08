@@ -147,7 +147,7 @@ NBS_CONFIG = {
 
 # Training Loop Configuration
 TRAIN_CONFIG = {
-    "steps_per_episode": 1200,       # Total environment steps per episode
+    "steps_per_episode": 1000,       # Total environment steps per episode
     "min_buffer_before_train": 1200, # Warmup replay entries; each env step adds 10 entries
     "update_iters_per_step": 1,      # Gradient updates per environment step
     "fixed_hoprate": 200.0,          # Fixed hopping rate for training
