@@ -1,8 +1,15 @@
 """
-MBPO reward-model training entry point for FHSS anti-jamming SAC.
+FHSS anti-jamming training entry point with SAC and an MBPO reward model.
 
-SAC remains the policy/critic learner.  The MBPO ensemble predicts one-step
-rewards only, then generates rollout=1 synthetic replay entries for SAC updates.
+This script keeps SAC as the actor/critic optimizer, and adds a lightweight
+model-based branch that predicts one-step rewards.  Unlike the original MBPO
+formulation for continuous control, this implementation does not predict the
+next PSD image.  The learned ensemble only maps
+
+    (state image, hop rate, block index, offset action) -> block reward
+
+and writes rollout_length=1 synthetic transitions into a separate replay buffer.
+SAC is then updated with a configurable mixture of real and synthetic samples.
 """
 
 import argparse
@@ -26,6 +33,23 @@ from train_offsets import build_agent_and_env, compute_block_rewards, setup_logg
 
 
 def sample_mixed_batch(real_buffer, model_buffer, batch_size, real_ratio):
+    """
+    Sample one SAC update batch from real and model-generated replay buffers.
+
+    Args:
+        real_buffer: Replay buffer containing transitions collected from the
+            real FHSS environment.
+        model_buffer: Replay buffer containing reward-model synthetic
+            transitions.
+        batch_size: Target number of transitions for one SAC update.
+        real_ratio: Fraction of the batch reserved for real transitions.  The
+            value is clipped into [0, 1] so command-line mistakes do not create
+            negative sample counts.
+
+    Returns:
+        A single replay sample dictionary with the same structure as
+        ``ReplayBuffer.sample``.
+    """
     real_ratio = float(np.clip(real_ratio, 0.0, 1.0))
     batches = []
     if model_buffer.size() > 0:
@@ -51,6 +75,15 @@ def store_real_transitions(
     offsets,
     per_block_rewards,
 ):
+    """
+    Split one environment step into ten block-level replay transitions.
+
+    The FHSS environment returns a full-step PSD observation and a vector of ten
+    offset actions.  SAC, however, learns a block-level decision: for each block
+    index i, choose the offset action for that block.  This helper converts one
+    environment interaction into ten transitions sharing the same state/next
+    state images but carrying different block indices, actions, and rewards.
+    """
     for i in range(10):
         action = int(offsets[i])
         next_block_idx = min(i + 1, 9)
@@ -68,6 +101,17 @@ def store_real_transitions(
 
 
 def train(args):
+    """
+    Run SAC training augmented with a reward-only MBPO ensemble.
+
+    The high-level loop is:
+        1. choose one offset for each of the ten FHSS blocks;
+        2. step the real environment once and store block-level transitions;
+        3. periodically train the reward ensemble on all real replay data;
+        4. generate one-step synthetic transitions into ``model_buffer``;
+        5. update SAC from a real/model mixed replay batch;
+        6. save diagnostic curves after training finishes.
+    """
     os.makedirs(args.output_dir, exist_ok=True)
     log_path = os.path.join(args.output_dir, args.log_file)
     logger = setup_logger(log_path)
@@ -113,6 +157,8 @@ def train(args):
     for step_idx in range(1, args.steps_per_episode + 1):
         step_start = time.time()
 
+        # A single environment step contains ten independently selected block
+        # offsets.  The hop rate is fixed in this training configuration.
         offsets = np.zeros(10, dtype=np.float32)
         for i in range(10):
             action = agent.take_action(state_img, fixed_hoprate, i)
@@ -128,6 +174,8 @@ def train(args):
             ber_blocks,
             info.get("hoprate_used", fixed_hoprate),
         )
+        # Store real experience before any model training so the reward model
+        # and SAC always train on data that has actually been observed.
         store_real_transitions(
             real_buffer,
             state_img,
@@ -146,6 +194,9 @@ def train(args):
             real_buffer.size() >= args.min_buffer_before_train
             and step_idx % args.model_train_freq == 0
         ):
+            # The ensemble is trained from real replay only.  Synthetic samples
+            # are never fed back into the reward model, which avoids compounding
+            # model bias in the supervised target set.
             last_model_stats = train_reward_model_from_replay(
                 reward_model,
                 real_buffer,
@@ -174,6 +225,8 @@ def train(args):
         train_stats = {}
         if real_buffer.size() >= args.min_buffer_before_train:
             for _ in range(args.update_iters_per_step):
+                # SAC receives a mixed batch.  ``real_ratio`` controls how much
+                # the learned model can influence policy updates.
                 batch = sample_mixed_batch(
                     real_buffer,
                     model_buffer,
@@ -236,6 +289,12 @@ def save_plots(
     plot_model_rewards,
     logger,
 ):
+    """
+    Save training diagnostics as PNG curves.
+
+    Plotting is deliberately best-effort: failed plotting should be logged but
+    should not invalidate a completed training run.
+    """
     try:
         plt.figure()
         plt.plot(plot_rewards)
@@ -279,6 +338,7 @@ def save_plots(
 
 
 def parse_args():
+    """Parse command-line options, using ``settings.py`` as the default source."""
     parser = argparse.ArgumentParser(description="SAC + MBPO reward-model training")
     parser.add_argument("--steps_per_episode", type=int, default=settings.TRAIN_CONFIG["steps_per_episode"])
     parser.add_argument("--output_dir", type=str, default="outputs/mbpo")

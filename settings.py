@@ -74,7 +74,7 @@ ENV_CONFIG = {
 # Jammer Configuration
 JAMMER_CONFIG = {
     # Global Jamming Mode: 'sweep', 'comb', or 'both'
-    "mode": "comb",
+    "mode": "sweep",
     
     # Sweep Jamming Configuration
     "sweep": {
@@ -126,12 +126,12 @@ MBPO_CONFIG = {
     "num_networks": 5,
     "num_elites": 3,
     "hidden_size": 200,
-    "model_train_freq": 50,
+    "model_train_freq": 20,
     "model_train_batch_size": 256,
-    "rollout_batch_size": 1024,
+    "rollout_batch_size": 512,
     "rollout_length": 1,
     "real_ratio": 0.5,
-    "model_replay_size": 12000,
+    "model_replay_size": 4096,
 }
 
 # Noisy Binary Search Configuration
@@ -147,10 +147,10 @@ NBS_CONFIG = {
 
 # Training Loop Configuration
 TRAIN_CONFIG = {
-    "steps_per_episode": 1000,       # Total environment steps per episode
-    "min_buffer_before_train": 1200, # Warmup replay entries; each env step adds 10 entries
+    "steps_per_episode": 800,       # Total environment steps per episode
+    "min_buffer_before_train": 512, # Warmup replay entries; each env step adds 10 entries
     "update_iters_per_step": 1,      # Gradient updates per environment step
-    "fixed_hoprate": 200.0,          # Fixed hopping rate for training
+    "fixed_hoprate": 100.0,          # Fixed hopping rate for training
 }
 
 # Reward Calculation Configuration
