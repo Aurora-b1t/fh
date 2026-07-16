@@ -20,9 +20,6 @@ import time
 from jammers_test import FastNoiseSource, ReactiveJammer, IndiscriminateJammer
 import test_settings as settings
 
-plt.rcParams['font.sans-serif'] = ['SimHei']
-plt.rcParams['axes.unicode_minus'] = False
-
 # -----------------------------
 # 基础函数
 # -----------------------------
