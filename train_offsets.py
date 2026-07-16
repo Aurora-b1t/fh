@@ -16,6 +16,11 @@ import matplotlib.pyplot as plt
 
 from fh_env import FHSSQPSKEnv
 from SAC import SAC, ReplayBuffer
+from offline_replay import (
+    add_block_transitions,
+    environment_metadata,
+    load_replay_into_buffer,
+)
 import settings
 
 def setup_logger(log_file):
@@ -102,7 +107,27 @@ def train(args):
     # Build components
     env, agent, buffer, device, n_actions = build_agent_and_env(args)
 
-    # Use fixed hoprate from settings
+    state_img, info = env.reset()
+    loaded_count, replay_metadata = load_replay_into_buffer(
+        args.offline_replay_path,
+        buffer,
+        expected_observation_shape=np.asarray(state_img).shape,
+        expected_num_actions=n_actions,
+        current_environment_metadata=environment_metadata(
+            settings.ENV_CONFIG,
+            settings.JAMMER_CONFIG,
+            settings.REWARD_CONFIG,
+        ),
+        logger=logging.getLogger(),
+    )
+    logger.info(
+        "Loaded %d offline real transitions from %s (mode=%s)",
+        loaded_count,
+        args.offline_replay_path,
+        replay_metadata.get("hoprate_mode", "unknown"),
+    )
+
+    # Use fixed hoprate for online training, matching the existing experiment.
     fixed_hoprate = settings.TRAIN_CONFIG["fixed_hoprate"]
 
     logger.info(f"Start Training for 1 episode with {args.steps_per_episode} steps...")
@@ -113,9 +138,6 @@ def train(args):
     episode = 1
     
     ep_start_time = time.time()
-    
-    # Reset Environment (returns obs)
-    state_img, info = env.reset()
     
     ep_block_rewards = []
     
@@ -162,23 +184,15 @@ def train(args):
         mean_step_ber = np.mean(ber_blocks) if len(ber_blocks) > 0 else 0.0
         mean_step_reward = np.mean(per_block_rewards) if len(per_block_rewards) > 0 else 0.0
 
-        # Store transitions in Replay Buffer (10 per step)
-        for i in range(10):
-            a_i = int(offsets[i])
-            r_i = float(per_block_rewards[i])
-            next_block_idx = min(i + 1, 9)
-
-            buffer.add(
-                state_img,         # s_t
-                fixed_hoprate,     # hop_rate
-                i,                 # block_idx
-                a_i,               # a_t
-                r_i,               # r_t
-                next_state_img,    # s_{t+1}
-                fixed_hoprate,     # hop_rate (same)
-                next_block_idx,    # next block_idx
-                False,             # done
-            )
+        add_block_transitions(
+            buffer,
+            state_img,
+            next_state_img,
+            info.get("hoprate_used", fixed_hoprate),
+            offsets,
+            per_block_rewards,
+            next_hoprate=fixed_hoprate,
+        )
 
         # Move to next state
         state_img = next_state_img
@@ -188,11 +202,10 @@ def train(args):
         # 4. Training Update
         # -------------------------------------------------------
         train_stats = {}
-        if buffer.size() >= args.min_buffer_before_train:
-            for _ in range(args.update_iters_per_step):
-                batch = buffer.sample(args.batch_size)
-                stats = agent.update(batch)
-                train_stats = stats
+        for _ in range(args.update_iters_per_step):
+            batch = buffer.sample(args.batch_size)
+            stats = agent.update(batch)
+            train_stats = stats
 
         step_duration = time.time() - step_start_time
         
@@ -281,7 +294,7 @@ def train(args):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--steps_per_episode", type=int, default=settings.TRAIN_CONFIG["steps_per_episode"])
-    parser.add_argument("--output_dir", type=str, default="outputs/offsets/sweep/512_start")
+    parser.add_argument("--output_dir", type=str, default="outputs/offsets/pre50000/comb/512_start")
     parser.add_argument("--log_file", type=str, default="training_log.txt")
 
     # Agent Params
@@ -294,8 +307,14 @@ def parse_args():
     # Buffer Params
     parser.add_argument("--replay_size", type=int, default=settings.BUFFER_CONFIG["capacity"])
     parser.add_argument("--batch_size", type=int, default=settings.BUFFER_CONFIG["batch_size"])
-    parser.add_argument("--min_buffer_before_train", type=int, default=settings.TRAIN_CONFIG["min_buffer_before_train"])
     parser.add_argument("--update_iters_per_step", type=int, default=settings.TRAIN_CONFIG["update_iters_per_step"])
+
+    parser.add_argument(
+        "--offline_replay_path",
+        type=str,
+        default=settings.OFFLINE_REPLAY_CONFIG["default_path"],
+        help="Offline real replay .npz file loaded before the first update.",
+    )
 
     parser.add_argument("--cpu_only", action="store_true", default=settings.CPU_ONLY)
     return parser.parse_args()

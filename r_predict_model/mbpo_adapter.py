@@ -87,21 +87,29 @@ def rollout_reward_model(
     """
     Generate one-step synthetic transitions with the learned reward model.
 
-    The rollout does not predict the next PSD image.  It reuses the sampled
-    starting image as ``next_state_img`` and advances only the block index.  This
-    keeps model usage limited to reward augmentation, matching the assumptions
-    in ``train_mbpo.py``.
+    The rollout does not predict the next PSD image.  It reuses the real
+    counterpart s_(t+1) image from the sampled transition as ``next_state_img``
+    and advances only the block index.  This keeps model usage limited to reward
+    augmentation, matching the assumptions in ``train_mbpo.py``.
     """
     starts = real_buffer.sample(batch_size)
     state_imgs = starts["state_imgs"]
-    hoprates = np.full(len(state_imgs), float(fixed_hoprate), dtype=np.float32)
+    next_state_imgs = starts["next_state_imgs"]
+    hoprates = np.asarray(
+        starts.get("hoprates", np.full(len(state_imgs), float(fixed_hoprate))),
+        dtype=np.float32,
+    )
+    next_hoprates = np.asarray(
+        starts.get("next_hoprates", np.full(len(state_imgs), float(fixed_hoprate))),
+        dtype=np.float32,
+    )
     block_idxs = starts["block_idxs"]
 
     actions = np.zeros(len(state_imgs), dtype=np.int64)
     for i in range(len(state_imgs)):
         # Query the current SAC policy on real replay states, then clip to the
         # discrete offset-action range accepted by the environment.
-        action = agent.take_action(state_imgs[i], float(fixed_hoprate), block_idxs[i])
+        action = agent.take_action(state_imgs[i], float(hoprates[i]), block_idxs[i])
         actions[i] = int(np.clip(action, 0, n_actions - 1))
 
     model_inputs = encode_transition_inputs(state_imgs, hoprates, block_idxs, actions)
@@ -109,17 +117,18 @@ def rollout_reward_model(
 
     for i in range(len(state_imgs)):
         block_idx = int(np.clip(round(float(block_idxs[i])), 0, 9))
-        next_block_idx = min(block_idx + 1, 9)
-        # Only the reward is synthetic here.  State images are copied from real
-        # replay because this reward model does not learn visual dynamics.
+        next_block_idx = (block_idx + 1) % 10
+        # Only the reward is synthetic here.  The next state image is copied from
+        # the real counterpart s_(t+1) of the sampled transition because this
+        # reward model does not learn visual dynamics.
         model_buffer.add(
             state_imgs[i],
-            float(fixed_hoprate),
+            float(hoprates[i]),
             block_idx,
             int(actions[i]),
             float(rewards[i]),
-            state_imgs[i].copy(),
-            float(fixed_hoprate),
+            next_state_imgs[i].copy(),
+            float(next_hoprates[i]),
             next_block_idx,
             False,
         )

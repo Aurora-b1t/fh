@@ -60,7 +60,7 @@ D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --help
 短训练冒烟测试：
 
 ```bash
-D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --steps_per_episode 3 --min_buffer_before_train 20 --batch_size 20 --output_dir outputs/smoke
+D:\Anaconda\envs\rl_fhss\python.exe train_offsets.py --steps_per_episode 3 --batch_size 20 --offline_replay_path outputs/offline_replay/replay_50000_random_hoprate.npz --output_dir outputs/smoke
 ```
 
 默认训练（默认输出目录 `outputs/offsets`）：
@@ -239,7 +239,7 @@ Noisy Binary Search 配置：
 训练循环配置：
 
 - `steps_per_episode`：单次训练运行的环境 step 数。
-- `min_buffer_before_train`：开始梯度更新前的 replay entry 数量。注意一个环境 step 会拆成 10 条 replay transition。
+- Offline replay is loaded before the first gradient update; configure its file with `OFFLINE_REPLAY_CONFIG` or `--offline_replay_path`.
 - `update_iters_per_step`：每个环境 step 后的梯度更新次数。
 - `fixed_hoprate`：offset 训练时使用的固定 hoprate。
 

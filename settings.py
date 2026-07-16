@@ -74,7 +74,7 @@ ENV_CONFIG = {
 # Jammer Configuration
 JAMMER_CONFIG = {
     # Global Jamming Mode: 'sweep', 'comb', or 'both'
-    "mode": "sweep",
+    "mode": "comb",
     
     # Sweep Jamming Configuration
     "sweep": {
@@ -111,14 +111,22 @@ SAC_CONFIG = {
     "critic_lr": 1e-4,
     "alpha_lr": 1e-4,
     "tau": 0.005,
-    "gamma": 0.99,
+    "gamma": 0.95,
     "target_entropy_ratio": 0.1,
 }
 
 # Replay Buffer Configuration
 BUFFER_CONFIG = {
-    "capacity": 12000,
+    "capacity": 50000,
     "batch_size": 256,
+}
+
+# Offline real-environment replay configuration.  Generate this file with
+# generate_offline_replay.py, or point both training scripts at another file.
+OFFLINE_REPLAY_CONFIG = {
+    "num_transitions": 50000,
+    "default_path": "outputs/offline_replay/replay_50000_random_hoprate.npz",
+    "hoprate_mode": "random",
 }
 
 # MBPO Reward-Model Configuration
@@ -126,12 +134,12 @@ MBPO_CONFIG = {
     "num_networks": 5,
     "num_elites": 3,
     "hidden_size": 200,
-    "model_train_freq": 20,
+    "model_train_freq": 1,
     "model_train_batch_size": 256,
-    "rollout_batch_size": 512,
+    "rollout_batch_size": 2000,
     "rollout_length": 1,
-    "real_ratio": 0.5,
-    "model_replay_size": 4096,
+    "real_ratio": 0.2,
+    "model_replay_size": 30000,
 }
 
 # Noisy Binary Search Configuration
@@ -147,9 +155,8 @@ NBS_CONFIG = {
 
 # Training Loop Configuration
 TRAIN_CONFIG = {
-    "steps_per_episode": 800,       # Total environment steps per episode
-    "min_buffer_before_train": 512, # Warmup replay entries; each env step adds 10 entries
-    "update_iters_per_step": 1,      # Gradient updates per environment step
+    "steps_per_episode": 150,       # Total environment steps per episode
+    "update_iters_per_step": 10,      # Gradient updates per environment step
     "fixed_hoprate": 100.0,          # Fixed hopping rate for training
 }
 

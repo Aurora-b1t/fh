@@ -22,6 +22,11 @@ import numpy as np
 import torch
 
 from SAC import ReplayBuffer
+from offline_replay import (
+    add_block_transitions,
+    environment_metadata,
+    load_replay_into_buffer,
+)
 from r_predict_model import EnsembleDynamicsModel
 from r_predict_model.mbpo_adapter import (
     concat_transition_batches,
@@ -84,20 +89,15 @@ def store_real_transitions(
     environment interaction into ten transitions sharing the same state/next
     state images but carrying different block indices, actions, and rewards.
     """
-    for i in range(10):
-        action = int(offsets[i])
-        next_block_idx = min(i + 1, 9)
-        buffer.add(
-            state_img,
-            fixed_hoprate,
-            i,
-            action,
-            float(per_block_rewards[i]),
-            next_state_img,
-            fixed_hoprate,
-            next_block_idx,
-            False,
-        )
+    add_block_transitions(
+        buffer,
+        state_img,
+        next_state_img,
+        fixed_hoprate,
+        offsets,
+        per_block_rewards,
+        next_hoprate=fixed_hoprate,
+    )
 
 
 def train(args):
@@ -123,6 +123,24 @@ def train(args):
     fixed_hoprate = settings.TRAIN_CONFIG["fixed_hoprate"]
 
     state_img, _info = env.reset()
+    loaded_count, replay_metadata = load_replay_into_buffer(
+        args.offline_replay_path,
+        real_buffer,
+        expected_observation_shape=np.asarray(state_img).shape,
+        expected_num_actions=n_actions,
+        current_environment_metadata=environment_metadata(
+            settings.ENV_CONFIG,
+            settings.JAMMER_CONFIG,
+            settings.REWARD_CONFIG,
+        ),
+        logger=logger,
+    )
+    logger.info(
+        "Loaded %d offline real transitions from %s (mode=%s)",
+        loaded_count,
+        args.offline_replay_path,
+        replay_metadata.get("hoprate_mode", "unknown"),
+    )
     reward_model = EnsembleDynamicsModel(
         network_size=args.num_networks,
         elite_size=args.num_elites,
@@ -190,10 +208,7 @@ def train(args):
         mean_step_reward = float(np.mean(per_block_rewards)) if len(per_block_rewards) > 0 else 0.0
         state_img = next_state_img
 
-        if (
-            real_buffer.size() >= args.min_buffer_before_train
-            and step_idx % args.model_train_freq == 0
-        ):
+        if step_idx % args.model_train_freq == 0:
             # The ensemble is trained from real replay only.  Synthetic samples
             # are never fed back into the reward model, which avoids compounding
             # model bias in the supervised target set.
@@ -223,17 +238,16 @@ def train(args):
             )
 
         train_stats = {}
-        if real_buffer.size() >= args.min_buffer_before_train:
-            for _ in range(args.update_iters_per_step):
-                # SAC receives a mixed batch.  ``real_ratio`` controls how much
-                # the learned model can influence policy updates.
-                batch = sample_mixed_batch(
-                    real_buffer,
-                    model_buffer,
-                    args.batch_size,
-                    args.real_ratio,
-                )
-                train_stats = agent.update(batch)
+        for _ in range(args.update_iters_per_step):
+            # SAC receives a mixed batch.  ``real_ratio`` controls how much
+            # the learned model can influence policy updates.
+            batch = sample_mixed_batch(
+                real_buffer,
+                model_buffer,
+                args.batch_size,
+                args.real_ratio,
+            )
+            train_stats = agent.update(batch)
 
         step_duration = time.time() - step_start
         plot_rewards.append(mean_step_reward)
@@ -341,7 +355,7 @@ def parse_args():
     """Parse command-line options, using ``settings.py`` as the default source."""
     parser = argparse.ArgumentParser(description="SAC + MBPO reward-model training")
     parser.add_argument("--steps_per_episode", type=int, default=settings.TRAIN_CONFIG["steps_per_episode"])
-    parser.add_argument("--output_dir", type=str, default="outputs/mbpo")
+    parser.add_argument("--output_dir", type=str, default="outputs/mbpo/comb/pre50000")
     parser.add_argument("--log_file", type=str, default="training_log.txt")
 
     parser.add_argument("--actor_lr", type=float, default=settings.SAC_CONFIG["actor_lr"])
@@ -352,8 +366,14 @@ def parse_args():
 
     parser.add_argument("--replay_size", type=int, default=settings.BUFFER_CONFIG["capacity"])
     parser.add_argument("--batch_size", type=int, default=settings.BUFFER_CONFIG["batch_size"])
-    parser.add_argument("--min_buffer_before_train", type=int, default=settings.TRAIN_CONFIG["min_buffer_before_train"])
     parser.add_argument("--update_iters_per_step", type=int, default=settings.TRAIN_CONFIG["update_iters_per_step"])
+
+    parser.add_argument(
+        "--offline_replay_path",
+        type=str,
+        default=settings.OFFLINE_REPLAY_CONFIG["default_path"],
+        help="Offline real replay .npz file loaded before the first update.",
+    )
 
     parser.add_argument("--real_ratio", type=float, default=settings.MBPO_CONFIG["real_ratio"])
     parser.add_argument("--model_train_freq", type=int, default=settings.MBPO_CONFIG["model_train_freq"])

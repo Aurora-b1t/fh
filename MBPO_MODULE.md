@@ -39,7 +39,7 @@ flatten(state_img, hoprate, block_idx, action) -> reward
 
 1. 只预测 reward，不预测 `next_state_img`。
 2. 合成样本的 rollout 长度固定为 1。
-3. 合成样本复用真实 replay 中的 PSD 图像作为 next state，只把 reward 替换为模型预测值，并把 `block_idx` 前进一位。
+3. 合成样本复用真实 replay 中该 transition 对应的下一帧 PSD 图像（真实 s_(t+1)）作为 next state，只把 reward 替换为模型预测值，并把 `block_idx` 前进一位（用 `(block_idx + 1) % 10`，第 10 个 block 后回到 0）。
 
 这样做的原因是 FHSS 状态包含 PSD waterfall 图像，直接学习下一帧图像动力学成本高且误差容易累积；而当前训练目标主要需要为 SAC 提供更多 block-level reward 监督信号。
 
@@ -67,7 +67,7 @@ done
 - `action`：当前 block 选择的 offset 离散动作。
 - `reward`：由 BER 和 hoprate 计算得到的 block-level reward。
 - `next_state_img`：下一环境 step 的 PSD 图像。
-- `next_block_idx`：下一 block 索引，当前实现为 `min(block_idx + 1, 9)`。
+- `next_block_idx`：下一 block 索引，当前实现为 `(block_idx + 1) % 10`，即第 10 个 block 结束后 s_(t+1) 的 block_idx 回到 0（新一轮 block 的起点）。
 - `done`：终止标记。
 
 一个环境 step 会产生 10 个 offset 动作，因此 `train_mbpo.py` 会把一次环境交互拆成 10 条 block-level replay transition。
@@ -184,13 +184,13 @@ hoprate         = fixed_hoprate
 block_idx       = sampled block_idx
 action          = actor selected action
 reward          = model predicted reward
-next_state_img  = sampled state_img.copy()
+next_state_img  = sampled next_state_img.copy()   # 真实对应 s_(t+1) 的 PSD
 next_hoprate    = fixed_hoprate
-next_block_idx  = min(block_idx + 1, 9)
+next_block_idx  = (block_idx + 1) % 10
 done            = False
 ```
 
-注意：这里的 `next_state_img` 并不是模型预测出来的，而是复用真实图像。这是当前 reward-only MBPO 设计的核心近似。
+注意：这里的 `next_state_img` 并不是模型预测出来的，而是复用真实经验中该 transition 对应的下一帧 PSD 图像（即真实的 s_(t+1)），而不是采样起点的 s_t。奖励部分仍由模型预测，这是当前 reward-only MBPO 设计的核心近似。`next_block_idx` 在第 10 个 block（block_idx=9）结束后回到 0，表示新一轮 block 的起点。
 
 ## 9. 真实样本与合成样本混合
 
@@ -249,13 +249,12 @@ MBPO_CONFIG = {
 ```python
 TRAIN_CONFIG = {
     "steps_per_episode": 800,
-    "min_buffer_before_train": 512,
     "update_iters_per_step": 1,
     "fixed_hoprate": 100.0,
 }
 ```
 
-其中 `min_buffer_before_train` 是 replay entry 数量，不是环境 step 数量。由于每个环境 step 拆成 10 条 transition，默认 512 条约等于 52 个环境 step 后开始训练。
+Offline real replay is loaded before the first SAC and reward-model update, so this training entry point has no replay warm-up gate.
 
 ## 11. 运行方式
 
@@ -268,7 +267,7 @@ python train_mbpo.py --help
 短 smoke test：
 
 ```bash
-python train_mbpo.py --steps_per_episode 5 --min_buffer_before_train 20 --batch_size 20 --model_train_freq 2 --rollout_batch_size 20 --output_dir outputs/mbpo_smoke
+python train_mbpo.py --steps_per_episode 5 --batch_size 20 --model_train_freq 2 --rollout_batch_size 20 --offline_replay_path outputs/offline_replay/replay_50000_random_hoprate.npz --output_dir outputs/mbpo_smoke
 ```
 
 默认训练：
@@ -340,7 +339,7 @@ model_train_freq = 20
 如果训练不稳定：
 
 - 提高 `real_ratio`，让 SAC 更依赖真实 replay。
-- 增大 `min_buffer_before_train`，等真实数据更多后再启用模型。
+- Select a larger or environment-specific offline replay file with `--offline_replay_path` when more real-data coverage is needed.
 - 降低 `rollout_batch_size`，减少早期低质量合成样本。
 - 检查 `ModelHoldout` 和 `model_reward.png`，确认模型 reward 没有明显漂移。
 
