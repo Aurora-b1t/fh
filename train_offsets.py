@@ -42,7 +42,6 @@ def build_agent_and_env(args):
     if torch.cuda.is_available() and not args.cpu_only:
         device = torch.device("cuda")
         logging.info(f"Training Device: GPU ({torch.cuda.get_device_name(0)})")
-        torch.backends.cudnn.benchmark = True
     else:
         device = torch.device("cpu")
         logging.info("Training Device: CPU")

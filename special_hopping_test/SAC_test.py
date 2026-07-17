@@ -150,7 +150,7 @@ class EASReplayBuffer:
 
 
 class PolicyNet(nn.Module):
-    def __init__(self, n_actions, extra_embedding_module=None):
+    def __init__(self, n_actions):
         super().__init__()
         self.conv1 = nn.LazyConv2d(out_channels=16, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(16)
@@ -160,13 +160,10 @@ class PolicyNet(nn.Module):
         self.flatten = nn.Flatten()
         self.conv_fc = nn.LazyLinear(256)
 
-        if extra_embedding_module is not None:
-            self.extra_embedding = extra_embedding_module
-        else:
-            self.extra_embedding = nn.Sequential(
-                nn.Linear(EXTRA_DIM, 64),
-                nn.ReLU(),
-            )
+        self.extra_embedding = nn.Sequential(
+            nn.Linear(EXTRA_DIM, 64),
+            nn.ReLU(),
+        )
 
         self.fc_hidden = nn.LazyLinear(256)
         self.fc_logits = nn.Linear(256, n_actions)
@@ -257,21 +254,16 @@ class SAC:
     ):
         self.critic_1 = ValueNet(n_actions).to(device)
         self.critic_2 = ValueNet(n_actions).to(device)
-        self.actor = PolicyNet(
-            n_actions,
-            extra_embedding_module=self.critic_1.extra_embedding,
-        ).to(device)
+        self.actor = PolicyNet(n_actions).to(device)
 
         self.target_critic_1 = ValueNet(n_actions).to(device)
         self.target_critic_2 = ValueNet(n_actions).to(device)
         self.target_critic_1.load_state_dict(self.critic_1.state_dict())
         self.target_critic_2.load_state_dict(self.critic_2.state_dict())
+        self.target_critic_1.eval()
+        self.target_critic_2.eval()
 
-        actor_params = [
-            p for name, p in self.actor.named_parameters()
-            if "extra_embedding" not in name
-        ]
-        self.actor_optimizer = torch.optim.Adam(actor_params, lr=actor_lr)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_1_optimizer = torch.optim.Adam(self.critic_1.parameters(), lr=critic_lr)
         self.critic_2_optimizer = torch.optim.Adam(self.critic_2.parameters(), lr=critic_lr)
 
@@ -307,10 +299,24 @@ class SAC:
             self.actor.train()
         return action
 
-    def take_action_sequence(self, state_img_np, hoprate):
-        actions = []
-        for block_idx in range(10):
-            actions.append(self.take_action(state_img_np, hoprate, block_idx))
+    def take_action_sequence(self, state_img_np, hoprate, num_blocks=10):
+        img = torch.tensor(
+            state_img_np,
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0).unsqueeze(0).repeat(num_blocks, 1, 1, 1)
+        extra = torch.tensor(
+            [[hoprate, b] for b in range(num_blocks)],
+            dtype=torch.float32,
+            device=self.device,
+        )
+        was_training = self.actor.training
+        self.actor.eval()
+        with torch.no_grad():
+            probs, _ = self.actor(img, extra)
+            actions = torch.distributions.Categorical(probs).sample().tolist()
+        if was_training:
+            self.actor.train()
         return actions
 
     def _build_extra_tensor(self, hoprates, block_idxs):
@@ -319,19 +325,26 @@ class SAC:
         return torch.cat([hoprates, block_idxs], dim=1)
 
     def calc_target(self, rewards, next_imgs, next_extras, dones):
-        next_probs, _ = self.actor(next_imgs, next_extras)
-        next_log_probs = torch.log(next_probs + 1e-8)
-        entropy = -torch.sum(next_probs * next_log_probs, dim=1, keepdim=True)
+        was_training = self.actor.training
+        self.actor.eval()
+        with torch.no_grad():
+            next_probs, _ = self.actor(next_imgs, next_extras)
+            next_log_probs = torch.log(next_probs + 1e-8)
+            entropy = -torch.sum(next_probs * next_log_probs, dim=1, keepdim=True)
 
-        q1 = self.target_critic_1(next_imgs, next_extras)
-        q2 = self.target_critic_2(next_imgs, next_extras)
-        min_q = torch.sum(next_probs * torch.min(q1, q2), dim=1, keepdim=True)
-        next_value = min_q + self.log_alpha.exp() * entropy
+            q1 = self.target_critic_1(next_imgs, next_extras)
+            q2 = self.target_critic_2(next_imgs, next_extras)
+            min_q = torch.sum(next_probs * torch.min(q1, q2), dim=1, keepdim=True)
+            next_value = min_q + self.log_alpha.exp() * entropy
+        if was_training:
+            self.actor.train()
         return rewards + self.gamma * next_value * (1 - dones)
 
     def soft_update(self, net, target_net):
         for param_target, param in zip(target_net.parameters(), net.parameters()):
             param_target.data.copy_(param_target.data * (1 - self.tau) + param.data * self.tau)
+        for buf_target, buf in zip(target_net.buffers(), net.buffers()):
+            buf_target.data.copy_(buf.data)
 
     def update(self, transition_dict):
         imgs = torch.tensor(
@@ -372,8 +385,8 @@ class SAC:
         td_target = self.calc_target(rewards, next_imgs, next_extras, dones)
         q1_pred = self.critic_1(imgs, extras).gather(1, actions)
         q2_pred = self.critic_2(imgs, extras).gather(1, actions)
-        critic_1_loss = F.mse_loss(q1_pred, td_target.detach())
-        critic_2_loss = F.mse_loss(q2_pred, td_target.detach())
+        critic_1_loss = F.mse_loss(q1_pred, td_target)
+        critic_2_loss = F.mse_loss(q2_pred, td_target)
 
         self.critic_1_optimizer.zero_grad()
         self.critic_2_optimizer.zero_grad()
@@ -386,6 +399,9 @@ class SAC:
         log_probs = torch.log(probs + 1e-8)
         entropy = -torch.sum(probs * log_probs, dim=1, keepdim=True)
 
+        critic_was_training = self.critic_1.training
+        self.critic_1.eval()
+        self.critic_2.eval()
         q1 = self.critic_1(imgs, extras)
         q2 = self.critic_2(imgs, extras)
         min_q = torch.sum(probs * torch.min(q1, q2), dim=1, keepdim=True)
@@ -394,6 +410,9 @@ class SAC:
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
+        if critic_was_training:
+            self.critic_1.train()
+            self.critic_2.train()
 
         alpha_loss = torch.mean(self.log_alpha * (entropy.detach() - self.target_entropy))
         self.log_alpha_optimizer.zero_grad()

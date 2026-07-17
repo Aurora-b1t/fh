@@ -37,16 +37,16 @@ def set_random_seeds(seed=None):
 
 # Each 100 ms block contains ten hops at a fixed 100 Hz hop rate. Block
 # numbering in the experiment is one-based: block 1 uses ODD_BLOCK_HOPS.
-ODD_BLOCK_HOPS = [0, 1, 9, 10, 11, 12, 13, 15, 17, 19]
-EVEN_BLOCK_HOPS = [0, 2, 7, 10, 11, 12, 14, 16, 18, 19]
+ODD_BLOCK_HOPS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
+EVEN_BLOCK_HOPS = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
 BLOCK_HOP_PATTERNS = [
     ODD_BLOCK_HOPS if block_number % 2 == 1 else EVEN_BLOCK_HOPS
     for block_number in range(1, 11)
 ]
 
 COMB_PHASE_CHANNELS = [
-    [3, 4, 5, 6, 8, 9, 15, 17],
-    [2, 4, 5, 6, 7, 14, 16, 18],
+    [0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 18, 19],
 ]
 
 EXPECTED_OFFSETS = [
