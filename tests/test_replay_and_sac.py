@@ -15,10 +15,46 @@ sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(SPECIAL_DIR))
 
 import offline_replay
+import SAC as main_sac_module
+import SAC_test as special_sac_module
 from SAC import SAC as MainSAC
 from SAC_test import ReplayBuffer as SpecialReplayBuffer
 from SAC_test import SAC as SpecialSAC
 from train_test import add_block_transitions as add_special_block_transitions
+
+
+class ExtraEncodingTests(unittest.TestCase):
+    MODULES = (main_sac_module, special_sac_module)
+
+    def test_block_index_is_one_hot_encoded(self):
+        raw_extra = torch.tensor(
+            [[10.0, 0.0], [505.0, 4.0], [1000.0, 9.0]],
+            dtype=torch.float32,
+        )
+
+        for module in self.MODULES:
+            with self.subTest(module=module.__name__):
+                encoded = module.normalize_extra(raw_extra)
+                self.assertEqual(tuple(encoded.shape), (3, 11))
+                torch.testing.assert_close(
+                    encoded[:, 0], torch.tensor([-1.0, 0.0, 1.0])
+                )
+                torch.testing.assert_close(
+                    encoded[:, 1:],
+                    torch.nn.functional.one_hot(
+                        torch.tensor([0, 4, 9]), num_classes=10
+                    ).to(torch.float32),
+                )
+
+    def test_block_index_must_be_in_range(self):
+        for module in self.MODULES:
+            for block_idx in (-1.0, 10.0):
+                raw_extra = torch.tensor(
+                    [[100.0, block_idx]], dtype=torch.float32
+                )
+                with self.subTest(module=module.__name__, value=block_idx):
+                    with self.assertRaises(RuntimeError):
+                        module.normalize_extra(raw_extra)
 
 
 class BlockTransitionTests(unittest.TestCase):

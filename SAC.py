@@ -16,35 +16,37 @@ from torch.nn import functional as F
 from torch.nn.parameter import UninitializedParameter
 
 
-EXTRA_DIM = 2
+NUM_BLOCKS = 10
+EXTRA_DIM = 1 + NUM_BLOCKS
 
-# Fixed min-max normalization constants for scalar inputs (hoprate, block_idx).
-# Target range: [-250, +250] (about one order of magnitude larger than the PSD
-# matrix, whose dB span is ~140). These bounds follow the known action/state
-# space; they are NOT computed from data, so normalization is deterministic and
-# parameter-free.
+# Fixed min-max normalization constants for the continuous hoprate input.
+# The categorical block index is encoded separately as a one-hot vector.
 HOPRATE_MIN = 10.0
 HOPRATE_MAX = 1000.0
-BLOCKIDX_MIN = 0.0
-BLOCKIDX_MAX = 9.0
-TARGET_MIN = -250.0
-TARGET_MAX = 250.0
 
 
 def normalize_extra(extra):
-    """Apply fixed min-max normalization to the (B, 2) extra tensor.
+    """Encode raw ``(hoprate, block_idx)`` features for the embedding MLP.
 
-    Column 0 is hoprate in [10, 1000]; column 1 is block_idx in [0, 9].
-    Each is mapped linearly to [TARGET_MIN, TARGET_MAX] = [-250, 250].
+    Hoprate is mapped to [-1, 1]. The integer block index is converted to a
+    ten-dimensional one-hot vector, producing an output of shape (B, 11).
     """
+    if extra.shape[-1] != 2:
+        raise ValueError(
+            f"Expected raw extra features with size 2, got {extra.shape[-1]}."
+        )
+
     hoprate = extra[..., 0:1]
-    block_idx = extra[..., 1:2]
-    norm_h = (hoprate - HOPRATE_MIN) / (HOPRATE_MAX - HOPRATE_MIN)
-    norm_b = (block_idx - BLOCKIDX_MIN) / (BLOCKIDX_MAX - BLOCKIDX_MIN)
-    scale = TARGET_MAX - TARGET_MIN  # 500
-    out_h = norm_h * scale + TARGET_MIN
-    out_b = norm_b * scale + TARGET_MIN
-    return torch.cat([out_h, out_b], dim=-1)
+    block_idx = extra[..., 1]
+    block_idx_long = block_idx.to(torch.long)
+
+    norm_hoprate = 2.0 * (
+        (hoprate - HOPRATE_MIN) / (HOPRATE_MAX - HOPRATE_MIN)
+    ) - 1.0
+    block_one_hot = F.one_hot(
+        block_idx_long, num_classes=NUM_BLOCKS
+    ).to(dtype=extra.dtype)
+    return torch.cat([norm_hoprate, block_one_hot], dim=-1)
 
 
 class ReplayBuffer:
