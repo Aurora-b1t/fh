@@ -258,10 +258,9 @@ class SAC:
 
         self.target_critic_1 = ValueNet(n_actions).to(device)
         self.target_critic_2 = ValueNet(n_actions).to(device)
-        self.target_critic_1.load_state_dict(self.critic_1.state_dict())
-        self.target_critic_2.load_state_dict(self.critic_2.state_dict())
         self.target_critic_1.eval()
         self.target_critic_2.eval()
+        self._target_critics_initialized = False
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_1_optimizer = torch.optim.Adam(self.critic_1.parameters(), lr=critic_lr)
@@ -324,7 +323,29 @@ class SAC:
         block_idxs = torch.tensor(block_idxs, dtype=torch.float32, device=self.device).view(-1, 1)
         return torch.cat([hoprates, block_idxs], dim=1)
 
+    def _ensure_target_critics_initialized(self, imgs, extras):
+        if self._target_critics_initialized:
+            return
+
+        critic_modes = (self.critic_1.training, self.critic_2.training)
+        self.critic_1.eval()
+        self.critic_2.eval()
+        try:
+            with torch.no_grad():
+                self.critic_1(imgs[:1], extras[:1])
+                self.critic_2(imgs[:1], extras[:1])
+        finally:
+            self.critic_1.train(critic_modes[0])
+            self.critic_2.train(critic_modes[1])
+
+        self.target_critic_1.load_state_dict(self.critic_1.state_dict())
+        self.target_critic_2.load_state_dict(self.critic_2.state_dict())
+        self.target_critic_1.eval()
+        self.target_critic_2.eval()
+        self._target_critics_initialized = True
+
     def calc_target(self, rewards, next_imgs, next_extras, dones):
+        self._ensure_target_critics_initialized(next_imgs, next_extras)
         was_training = self.actor.training
         self.actor.eval()
         with torch.no_grad():

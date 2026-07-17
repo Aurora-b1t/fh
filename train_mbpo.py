@@ -86,8 +86,9 @@ def store_real_transitions(
     The FHSS environment returns a full-step PSD observation and a vector of ten
     offset actions.  SAC, however, learns a block-level decision: for each block
     index i, choose the offset action for that block.  This helper converts one
-    environment interaction into ten transitions sharing the same state/next
-    state images but carrying different block indices, actions, and rewards.
+    environment interaction into a ten-state sequence. Internal blocks keep
+    the current PSD image and advance the block index; only block 9 transitions
+    to the next environment PSD image and wraps the index to zero.
     """
     add_block_transitions(
         buffer,

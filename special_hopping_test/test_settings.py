@@ -50,8 +50,8 @@ COMB_PHASE_CHANNELS = [
 ]
 
 EXPECTED_OFFSETS = [
-    [1, 0, 1, 0, 1, 0, 1, 0, 1, 0],
-    [0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+    [1, 0, 1, 0, 1, 0, 1, 0, 1, 0], #Invalid offset pattern, should be ignored
+    [0, 1, 0, 1, 0, 1, 0, 1, 0, 1], #Invalid offset pattern, should be ignored
 ]
 
 

@@ -86,13 +86,14 @@ def add_block_transitions(
         raise ValueError("Exactly ten offsets and block rewards are required.")
 
     for block_idx in range(NUM_BLOCKS):
+        is_last_block = block_idx == NUM_BLOCKS - 1
         buffer.add(
             state_img,
             hoprate,
             block_idx,
             int(offsets[block_idx]),
             float(per_block_rewards[block_idx]),
-            next_state_img,
+            next_state_img if is_last_block else state_img,
             hoprate,
             (block_idx + 1) % NUM_BLOCKS,
             False,

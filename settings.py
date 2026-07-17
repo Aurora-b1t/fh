@@ -125,7 +125,7 @@ BUFFER_CONFIG = {
 # generate_offline_replay.py, or point both training scripts at another file.
 OFFLINE_REPLAY_CONFIG = {
     "num_transitions": 50000,
-    "default_path": "outputs/offline_replay/replay_50000_random_hoprate.npz",
+    "default_path": "outputs/offline_replay/replay_50000_random_hoprate_v2.npz",
     "hoprate_mode": "random",
 }
 

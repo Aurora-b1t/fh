@@ -87,10 +87,10 @@ def rollout_reward_model(
     """
     Generate one-step synthetic transitions with the learned reward model.
 
-    The rollout does not predict the next PSD image.  It reuses the real
-    counterpart s_(t+1) image from the sampled transition as ``next_state_img``
-    and advances only the block index.  This keeps model usage limited to reward
-    augmentation, matching the assumptions in ``train_mbpo.py``.
+    The rollout does not predict the next PSD image. It reuses the sampled real
+    transition's ``next_state_img``: internal blocks keep the current PSD, while
+    block 9 advances to the next environment PSD. This keeps model usage limited
+    to reward augmentation, matching the assumptions in ``train_mbpo.py``.
     """
     starts = real_buffer.sample(batch_size)
     state_imgs = starts["state_imgs"]
@@ -118,9 +118,8 @@ def rollout_reward_model(
     for i in range(len(state_imgs)):
         block_idx = int(np.clip(round(float(block_idxs[i])), 0, 9))
         next_block_idx = (block_idx + 1) % 10
-        # Only the reward is synthetic here.  The next state image is copied from
-        # the real counterpart s_(t+1) of the sampled transition because this
-        # reward model does not learn visual dynamics.
+        # Only the reward is synthetic here. The sequential next state is copied
+        # from the sampled real transition because this model learns no dynamics.
         model_buffer.add(
             state_imgs[i],
             float(hoprates[i]),

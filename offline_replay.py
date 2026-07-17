@@ -8,7 +8,7 @@ from collections import deque
 import numpy as np
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 NUM_BLOCKS = 10
 REPLAY_KEYS = (
     "state_imgs",
@@ -88,14 +88,15 @@ def add_block_transitions(
     for block_idx in range(NUM_BLOCKS):
         if max_transitions is not None and added >= max_transitions:
             break
+        is_last_block = block_idx == NUM_BLOCKS - 1
         buffer.add(
             state_img,
             hoprate,
             block_idx,
             int(offsets[block_idx]),
             float(per_block_rewards[block_idx]),
-            next_state_img,
-            next_hoprate,
+            next_state_img if is_last_block else state_img,
+            next_hoprate if is_last_block else hoprate,
             (block_idx + 1) % NUM_BLOCKS,
             False,
         )
@@ -166,6 +167,26 @@ def save_replay_buffer(path, buffer, metadata=None):
     )
 
 
+def _validate_format_version(metadata):
+    file_version = metadata.get("format_version")
+    if file_version is None:
+        raise ValueError(
+            "Offline replay metadata is missing format_version; "
+            f"expected version {FORMAT_VERSION}."
+        )
+    try:
+        parsed_version = int(file_version)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Offline replay format_version is invalid: {file_version!r}."
+        ) from exc
+    if parsed_version != FORMAT_VERSION:
+        raise ValueError(
+            f"Unsupported offline replay format version: {file_version}; "
+            f"expected {FORMAT_VERSION}."
+        )
+
+
 def _load_arrays(path):
     try:
         archive = np.load(path, allow_pickle=False)
@@ -175,15 +196,17 @@ def _load_arrays(path):
         raise ValueError(f"Could not read offline replay file '{path}': {exc}") from exc
 
     with archive:
-        missing = [key for key in REPLAY_KEYS if key not in archive]
-        if missing:
-            raise ValueError(f"Offline replay is missing fields: {missing}")
-        arrays = {key: np.asarray(archive[key]) for key in REPLAY_KEYS}
         metadata_value = archive["metadata"] if "metadata" in archive else np.asarray("{}")
         try:
             metadata = json.loads(str(metadata_value.item()))
         except (TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("Offline replay metadata is not valid JSON.") from exc
+        _validate_format_version(metadata)
+
+        missing = [key for key in REPLAY_KEYS if key not in archive]
+        if missing:
+            raise ValueError(f"Offline replay is missing fields: {missing}")
+        arrays = {key: np.asarray(archive[key]) for key in REPLAY_KEYS}
     return arrays, metadata
 
 
@@ -197,12 +220,6 @@ def load_replay_into_buffer(
 ):
     """Validate an offline replay file and append it to a ReplayBuffer."""
     arrays, metadata = _load_arrays(path)
-    file_version = metadata.get("format_version")
-    if file_version is not None and int(file_version) != FORMAT_VERSION:
-        raise ValueError(
-            f"Unsupported offline replay format version: {file_version}; "
-            f"expected {FORMAT_VERSION}."
-        )
     lengths = {key: len(value) for key, value in arrays.items()}
     if len(set(lengths.values())) != 1:
         raise ValueError(f"Offline replay fields have inconsistent lengths: {lengths}")
