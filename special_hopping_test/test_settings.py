@@ -38,7 +38,7 @@ def set_random_seeds(seed=None):
 # Each 100 ms block contains ten hops at a fixed 100 Hz hop rate. Block
 # numbering in the experiment is one-based: block 1 uses ODD_BLOCK_HOPS.
 ODD_BLOCK_HOPS = [1, 1, 1, 1, 1, 1, 1, 1, 1, 1]
-EVEN_BLOCK_HOPS = [4, 4, 4, 4, 4, 4, 4, 4, 4, 4]
+EVEN_BLOCK_HOPS = [5, 5, 5, 5, 5, 5, 5, 5, 5, 5]
 BLOCK_HOP_PATTERNS = [
     ODD_BLOCK_HOPS if block_number % 2 == 1 else EVEN_BLOCK_HOPS
     for block_number in range(1, 11)
@@ -46,7 +46,7 @@ BLOCK_HOP_PATTERNS = [
 
 COMB_PHASE_CHANNELS = [
     [0, 1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 18, 19],
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 16, 17, 18, 19],
 ]
 
 EXPECTED_OFFSETS = [
@@ -107,7 +107,7 @@ SAC_CONFIG = {
     "alpha_lr": 1e-4,
     "tau": 0.005,
     "gamma": 0.95,
-    "target_entropy_ratio": 0.1,
+    "target_entropy_ratio": 0.2,
 }
 
 BUFFER_CONFIG = {
@@ -122,7 +122,7 @@ TRAIN_CONFIG = {
 }
 
 REWARD_CONFIG = {
-    "base_reward": 4.0,
-    "ber_penalty": 32.0,
+    "base_reward": 10.0,
+    "ber_penalty": 80.0,
     "hoprate_penalty": 0,
 }
