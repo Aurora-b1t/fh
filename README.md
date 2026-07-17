@@ -359,7 +359,7 @@ Replay 将这 10 个 block 建模为顺序状态：block 0～8 的下一状态�
 当前 [SAC.py](SAC.py) / [SAC_test.py](special_hopping_test/SAC_test.py) 的实现要点（近期已修复若干问题）：
 
 - **actor 与 critic 各自独立维护 `extra_embedding`**，不再共享；actor 优化器直接更新自己的 embedding。
-- **block index 使用 one-hot 编码**：原始 `[hoprate, block_idx]` 在网络内转换为 1 维归一化 hoprate 与 10 维 block one-hot，再输入 `extra_embedding`。
+- **block index 使用 one-hot 编码**：原始 `[hoprate, block_idx]` 在网络内转换为 1 维归一化 hoprate 与 10 维 block one-hot，整体放大 10 倍后再输入 `extra_embedding`。
 - **目标网络固定为 eval 模式**：`target_critic_1/2` 始终用 BatchNorm running stats，不随 batch 抖动。
 - **Lazy target 延迟初始化**：首次 TD target 计算前先物化 online critics，再完整复制参数和 BatchNorm buffers；后续只做 soft update。
 - **`soft_update` 同步 BatchNorm buffers**（running_mean/running_var/num_batches_tracked）到目标网络。

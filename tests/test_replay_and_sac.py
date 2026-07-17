@@ -37,13 +37,13 @@ class ExtraEncodingTests(unittest.TestCase):
                 encoded = module.normalize_extra(raw_extra)
                 self.assertEqual(tuple(encoded.shape), (3, 11))
                 torch.testing.assert_close(
-                    encoded[:, 0], torch.tensor([-1.0, 0.0, 1.0])
+                    encoded[:, 0], torch.tensor([-10.0, 0.0, 10.0])
                 )
                 torch.testing.assert_close(
                     encoded[:, 1:],
                     torch.nn.functional.one_hot(
                         torch.tensor([0, 4, 9]), num_classes=10
-                    ).to(torch.float32),
+                    ).to(torch.float32) * 10.0,
                 )
 
     def test_block_index_must_be_in_range(self):

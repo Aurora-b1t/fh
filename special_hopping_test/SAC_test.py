@@ -18,6 +18,7 @@ from torch.nn.parameter import UninitializedParameter
 
 NUM_BLOCKS = 10
 EXTRA_DIM = 1 + NUM_BLOCKS
+EXTRA_INPUT_SCALE = 10.0
 
 # Fixed min-max normalization constants for the continuous hoprate input.
 # The categorical block index is encoded separately as a one-hot vector.
@@ -46,7 +47,8 @@ def normalize_extra(extra):
     block_one_hot = F.one_hot(
         block_idx_long, num_classes=NUM_BLOCKS
     ).to(dtype=extra.dtype)
-    return torch.cat([norm_hoprate, block_one_hot], dim=-1)
+    encoded_extra = torch.cat([norm_hoprate, block_one_hot], dim=-1)
+    return encoded_extra * EXTRA_INPUT_SCALE
 
 
 class ReplayBuffer:
